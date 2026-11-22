@@ -311,6 +311,43 @@ void cpu_job_fn(void* vctx, int i) {
     g4::cpu::expert(*c.f, j.blob, j.act, j.nt, j.out, scratch);
 }
 
+/// A layer's missed experts split by rows over every pool thread (fewer experts than threads would leave cores idle
+/// and stream each expert at one core's speed): gate/up row chunks, then GeGLU + its activation per expert, then down
+/// row chunks.  Task i of a row phase is chunk i % chunks of job i / chunks.
+struct SplitCtx {
+    const g4::ExpertFmt* f = nullptr;
+    const CpuJob* jobs = nullptr;
+    int chunks = 1;
+    float* gu = nullptr;        // [job][kTmax][2 * n_ff]
+    uint8_t* ah = nullptr;      // [job][kTmax][act_bytes(n_ff)]
+    size_t ah_stride = 0;
+};
+void split_gu_fn(void* vctx, int i) {
+    const SplitCtx& c = *(const SplitCtx*) vctx;
+    const int job = i / c.chunks, ch = i % c.chunks, rows = 2 * c.f->n_ff;
+    const CpuJob& j = c.jobs[job];
+    float* out[kTmax];
+    for (int t = 0; t < j.nt; ++t) out[t] = c.gu + ((size_t) job * kTmax + t) * (size_t) rows;
+    g4::cpu::gate_up_rows(*c.f, j.blob, j.act, j.nt, out, (int) ((int64_t) rows * ch / c.chunks), (int) ((int64_t) rows * (ch + 1) / c.chunks));
+}
+void split_mid_fn(void* vctx, int job) {
+    static thread_local std::vector<float> h;
+    const SplitCtx& c = *(const SplitCtx*) vctx;
+    const CpuJob& j = c.jobs[job];
+    h.resize((size_t) c.f->n_ff);
+    for (int t = 0; t < j.nt; ++t)
+        g4::cpu::geglu_quantize(c.gu + ((size_t) job * kTmax + t) * (size_t) (2 * c.f->n_ff), c.f->n_ff, h.data(),
+                                c.ah + ((size_t) job * kTmax + t) * c.ah_stride);
+}
+void split_down_fn(void* vctx, int i) {
+    const SplitCtx& c = *(const SplitCtx*) vctx;
+    const int job = i / c.chunks, ch = i % c.chunks, rows = c.f->n_embd;
+    const CpuJob& j = c.jobs[job];
+    const void* ah[kTmax];
+    for (int t = 0; t < j.nt; ++t) ah[t] = c.ah + ((size_t) job * kTmax + t) * c.ah_stride;
+    g4::cpu::down_rows(*c.f, j.blob, ah, j.nt, j.out, (int) ((int64_t) rows * ch / c.chunks), (int) ((int64_t) rows * (ch + 1) / c.chunks));
+}
+
 struct Stats {
     long long passes = 0, rows = 0, ent_gpu = 0, ent_cpu = 0, uploads = 0, cpu_jobs = 0;
     double ms_cpu = 0, ms_wait_route = 0, ms_plan = 0;
@@ -341,6 +378,11 @@ struct Engine {
     cudaEvent_t ev_route = nullptr;
     std::unique_ptr<C::ExpertPool> pool;
     std::vector<CpuJob> jobs;
+    // the row-split path's buffers (SplitCtx) and its switch: a layer with fewer missed experts than `split_below` (0: the
+    // pool's thread count) has their rows split into about `split_tasks` tasks per thread
+    float* sp_gu = nullptr;
+    uint8_t* sp_ah = nullptr;
+    int split_below = 0, split_tasks = 3;
     std::vector<int16_t> idx_of;   // per expert: its group (>= 0) or job (<= -2) of the layer being planned, -1: none
     Stats stats;
     // the cache's policy (see adapt())
@@ -421,6 +463,9 @@ struct Engine {
         h_logits = halloc<float>(T * V);
         h_groups = halloc<G::Group>(T * Kp);
         jobs.resize(T * Kp);
+        sp_gu = (float*) _aligned_malloc(T * Kp * kTmax * 2 * (size_t) m->n_ff_exp * sizeof(float), 64);
+        sp_ah = (uint8_t*) _aligned_malloc(T * Kp * kTmax * ah_stride, 64);
+        if (!sp_gu || !sp_ah) die("no host memory for the CPU experts' scratch");
         idx_of.assign((size_t) m->n_expert, -1);
         pool = std::make_unique<C::ExpertPool>(threads, true, true);
         std::fprintf(stderr, "strata-g4: context %d, sliding ring %d cells, CPU pool %d workers%s, AVX-VNNI %s\n", ctx, ring,
@@ -646,8 +691,24 @@ struct Engine {
             stats.ms_plan += ms_since(tq);
             if (n_jobs > 0) {
                 const auto tc = Clock::now();
-                CpuCtx cc{&y.f, jobs.data()};
-                pool->run_range(n_jobs, cpu_job_fn, &cc);
+                const int threads = pool->workers() + (pool->host_works() ? 1 : 0);
+                if (n_jobs < (split_below > 0 ? split_below : threads)) {
+                    SplitCtx sx;
+                    sx.f = &y.f;
+                    sx.jobs = jobs.data();
+                    sx.chunks = std::max(1, std::min(64, (threads * split_tasks + n_jobs - 1) / n_jobs));
+                    sx.gu = sp_gu;
+                    sx.ah = sp_ah;
+                    sx.ah_stride = ah_stride;
+                    pool->run_range(n_jobs * sx.chunks, split_gu_fn, &sx);
+                    if (n_jobs > 2) pool->run_range(n_jobs, split_mid_fn, &sx);
+                    else
+                        for (int j = 0; j < n_jobs; ++j) split_mid_fn(&sx, j);
+                    pool->run_range(n_jobs * sx.chunks, split_down_fn, &sx);
+                } else {
+                    CpuCtx cc{&y.f, jobs.data()};
+                    pool->run_range(n_jobs, cpu_job_fn, &cc);
+                }
                 stats.ms_cpu += ms_since(tc);
                 CK(cudaMemcpyAsync(parts_cpu, h_parts, (size_t) n_miss * N * 4, cudaMemcpyHostToDevice, st));
             }
@@ -746,6 +807,8 @@ int strata::gemma4::run(int argc, char** argv) {
         else if (a == "--decay") E.decay = (float) std::atof(val().c_str());
         else if (a == "--decay-every") E.decay_every = std::atoi(val().c_str());
         else if (a == "--profile") E.profile = std::atoi(val().c_str()) != 0;
+        else if (a == "--split-below") E.split_below = std::atoi(val().c_str());
+        else if (a == "--split-tasks") E.split_tasks = std::atoi(val().c_str());
         else if (a == "--help" || a == "-h") {
             std::printf("strata-g4 --model GGUF --tokens-file F [--n N] [--ctx 4096] [--threads N] [--slots S | --expert-vram-mib M]\n"
                         "          [--adapt 0|1] [--promote-min X] [--up-max N] [--decay X] [--decay-every N] [--profile 0|1]\n"
