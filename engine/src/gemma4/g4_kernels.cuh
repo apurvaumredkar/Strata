@@ -308,6 +308,33 @@ __global__ void k_copy(const float* src, float* dst, int64_t n) {
     if (i < n) dst[i] = src[i];
 }
 
+/// How sure a softmax over n floats is of its largest value: conf[0] = 1 / sum(exp(x - max)).  Two stages: grid 64
+/// (kArgBlocks) block 256 writes each block's sum into ps; one block of 64 adds them.  Only the drafter's guesses are
+/// weighed with it (how many to chain), never a token of the answer.
+__global__ void k_conf1(const float* x, int n, const float* vmax, float* ps) {
+    __shared__ float sv[kThreads];
+    const float mx = vmax[0];
+    float a = 0.f;
+    for (int i = blockIdx.x * kThreads + threadIdx.x; i < n; i += 64 * kThreads) a += __expf(x[i] - mx);
+    sv[threadIdx.x] = a;
+    __syncthreads();
+    for (int s = kThreads / 2; s > 0; s >>= 1) {
+        if ((int) threadIdx.x < s) sv[threadIdx.x] += sv[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) ps[blockIdx.x] = sv[0];
+}
+__global__ void k_conf2(const float* ps, float* conf) {
+    __shared__ float sv[64];
+    sv[threadIdx.x] = ps[threadIdx.x];
+    __syncthreads();
+    for (int s = 32; s > 0; s >>= 1) {
+        if ((int) threadIdx.x < s) sv[threadIdx.x] += sv[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) conf[0] = 1.0f / sv[0];
+}
+
 /// Argmax of rows of n floats (the lower index wins a tie), two stages: stage 1 grid (kArgBlocks, T) block 256 writes
 /// each block's best into pv / pi [T][kArgBlocks]; stage 2 grid T block kArgBlocks picks the row's.
 constexpr int kArgBlocks = 64;

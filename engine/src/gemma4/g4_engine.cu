@@ -495,7 +495,11 @@ struct Engine {
     void *d_xq = nullptr, *d_hq = nullptr;
     int32_t *d_tok = nullptr, *d_meta = nullptr, *h_meta = nullptr, *h_draft = nullptr;
     float2 *d_cs_swa = nullptr, *d_cs_glb = nullptr;
-    int draft_n = 3;
+    int draft_n = 7;
+    // chaining by confidence (draft_more > 0): `sure` is the product of the drafter's probabilities of its guesses so far;
+    // a guess is kept while sure >= draft_keep, and another is asked for while sure >= draft_more (up to draft_n)
+    float draft_more = 0.98f, draft_keep = 0.5f;
+    float *d_dv = nullptr, *d_ps = nullptr, *d_conf = nullptr, *h_conf = nullptr;
     long long drafts_made = 0, drafts_kept = 0;
     double ms_draft = 0;
     // the cache's policy (see adapt())
@@ -613,6 +617,10 @@ struct Engine {
         d_meta = dalloc<int32_t>(8);
         h_meta = halloc<int32_t>(8);
         h_draft = halloc<int32_t>(kTmax + 1);
+        d_dv = dalloc<float>(1);
+        d_ps = dalloc<float>(G::kArgBlocks);
+        d_conf = dalloc<float>(1);
+        h_conf = halloc<float>(1);
         d_cs_swa = dalloc<float2>((size_t) m->hd_swa / 2);
         d_cs_glb = dalloc<float2>((size_t) m->hd / 2);
     }
@@ -621,7 +629,7 @@ struct Engine {
     /// hidden state in `hprev` (the main model's final normed state of the last kept row).  They land in h_draft[0, nd).
     /// The drafter reads the main model's attention cache as it stands (cells below `pos`); every step runs at
     /// position `pos`.
-    void draft(int32_t tok, int nd) {
+    int draft(int32_t tok, int nd) {
         const Drafter& d = *dr;
         const auto t0 = Clock::now();
         const int N = d.n_embd, NM = m->n_embd, p = (int) pos;
@@ -640,6 +648,8 @@ struct Engine {
                                                           std::pow(m->rope_base, -2.0f / (float) m->hd));
         const Layer& ks = m->layers[(size_t) m->n_layer - 2];
         const Layer& kg = m->layers[(size_t) m->n_layer - 1];
+        float sure = 1.f;
+        int got = 0;
         for (int sidx = 0; sidx < nd; ++sidx) {
             // [the token's main-model embedding | the hidden state] -> the drafter's width
             G::k_embed<<<dim3((unsigned) (NM / 32), 1), 32, 0, st>>>(m->embd.d, d_tok + sidx, d_xh, NM, std::sqrt((float) NM));
@@ -675,12 +685,27 @@ struct Engine {
             K::native_quantize_q8_1(d_hn, d_xq, N, 1, st);
             K::native_mmvq(d.embd.type, d.embd.d, d_xq, d_logits, N, m->n_vocab, 1, st);
             G::k_argmax1<<<dim3(G::kArgBlocks, 1), G::kThreads, 0, st>>>(d_logits, m->n_vocab, pv, pi);
-            G::k_argmax2<<<1, G::kArgBlocks, 0, st>>>(pv, pi, d_tok + sidx + 1, nullptr);
+            G::k_argmax2<<<1, G::kArgBlocks, 0, st>>>(pv, pi, d_tok + sidx + 1, d_dv);
+            if (draft_more > 0.f) {
+                G::k_conf1<<<G::kArgBlocks, G::kThreads, 0, st>>>(d_logits, m->n_vocab, d_dv, d_ps);
+                G::k_conf2<<<1, G::kArgBlocks, 0, st>>>(d_ps, d_conf);
+                CK(cudaMemcpyAsync(h_conf, d_conf, 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaMemcpyAsync(h_draft + sidx, d_tok + sidx + 1, 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
+                sure *= h_conf[0];
+                if (sure < draft_keep) break;
+                got = sidx + 1;
+                if (sure < draft_more) break;
+            }
             if (sidx + 1 < nd) K::native_mmvq(d.post.type, d.post.d, d_xq, hprev, N, NM, 1, st);   // the next step's hidden state
         }
-        CK(cudaMemcpyAsync(h_draft, d_tok + 1, (size_t) nd * 4, cudaMemcpyDeviceToHost, st));
-        CK(cudaStreamSynchronize(st));
+        if (draft_more <= 0.f) {
+            CK(cudaMemcpyAsync(h_draft, d_tok + 1, (size_t) nd * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            got = nd;
+        }
         ms_draft += ms_since(t0);
+        return got;
     }
 
     /// The expert slots: `slots` per layer (-1: what fits in `vram_mib`, or in the free VRAM less a reserve), the first
@@ -1007,6 +1032,8 @@ int strata::gemma4::run(int argc, char** argv) {
         else if (a == "--jobs-file") jobs_file = val();
         else if (a == "--draft") draft_file = val();
         else if (a == "--draft-n") E.draft_n = std::atoi(val().c_str());
+        else if (a == "--draft-more") E.draft_more = (float) std::atof(val().c_str());
+        else if (a == "--draft-keep") E.draft_keep = (float) std::atof(val().c_str());
         else if (a == "--reps") reps = std::atoi(val().c_str());
         else if (a == "--n") n_gen = std::atoi(val().c_str());
         else if (a == "--ctx") ctx = std::atoi(val().c_str());
@@ -1027,7 +1054,9 @@ int strata::gemma4::run(int argc, char** argv) {
                         "          [--adapt 0|1] [--promote-min X] [--up-max N] [--decay X] [--decay-every N] [--profile 0|1]\n"
                         "          [--force-file F] [--top2 F] [--full-logits F] [--bench-json F] [--device N]\n"
                         "          [--jobs-file F [--reps R]]   lines: <id> <tokens file> <new tokens> [<forced ids file>]\n"
-                        "          [--draft GGUF|none] [--draft-n 0..7]   the assistant model (default: the one beside the model)\n");
+                        "          [--draft GGUF|none] [--draft-n 0..7]   the assistant model (default: the one beside the model)\n"
+                        "          [--draft-more P] [--draft-keep P]      chain guesses by the drafter's confidence: ask for another while the\n"
+                        "                                                 product of its probabilities is >= P, keep a guess while >= P (0: always)\n");
             return 0;
         } else die("unknown option " + a + " (see --help)");
     }
@@ -1148,8 +1177,8 @@ int strata::gemma4::run(int argc, char** argv) {
                 int32_t rows[kTmax];
                 while ((int) gen.size() < ng) {
                     const int room = std::min(ctx - (int) E.pos - 1, ng - (int) gen.size() - 1);
-                    const int nd = std::max(0, std::min(E.draft_n, room));
-                    if (nd > 0) E.draft(next, nd);
+                    const int nd_max = std::max(0, std::min(E.draft_n, room));
+                    const int nd = nd_max > 0 ? E.draft(next, nd_max) : 0;
                     rows[0] = next;
                     for (int d = 0; d < nd; ++d) rows[d + 1] = E.h_draft[d];
                     E.forward(rows, 1 + nd, true);
