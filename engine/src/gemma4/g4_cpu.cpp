@@ -12,6 +12,9 @@
 #include <cstring>
 
 #include <immintrin.h>
+#include <algorithm>
+#include <cstdio>
+#include <atomic>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <malloc.h>
@@ -261,6 +264,46 @@ void down_rows_32(const ExpertFmt& f, const uint8_t* blob, const void* const* ac
 bool available() noexcept { return caps().avx2; }
 bool have_avx_vnni() noexcept { return caps().vnni; }
 
+namespace {
+// G4_ZERO_STATS=1 (a diagnostic, docs/12): how many quantized activations are 0, by row length, printed at exit.
+struct ZeroStats {
+    std::atomic<long long> rows{0}, vals{0}, z0{0}, z1{0}, z3{0}, blocks{0}, zblocks{0};
+};
+ZeroStats g_zs[2];   // [0] rows of experts' inputs (n > 1024), [1] rows of their hidden values
+const bool g_zero_stats = [] {
+    const char* e = std::getenv("G4_ZERO_STATS");
+    const bool on = e && e[0] == '1';
+    if (on)
+        std::atexit([] {
+            for (int k = 0; k < 2; ++k) {
+                const ZeroStats& z = g_zs[k];
+                const double v = (double) std::max<long long>(z.vals.load(), 1);
+                std::fprintf(stderr, "g4 zero stats, %s: %lld rows, |q| = 0: %.2f%%, <= 1: %.2f%%, <= 3: %.2f%%, blocks of 32 all zero: %.2f%%\n",
+                             k ? "hidden (down's input)" : "input (gate/up's input)", z.rows.load(), 100.0 * z.z0.load() / v,
+                             100.0 * z.z1.load() / v, 100.0 * z.z3.load() / v,
+                             100.0 * z.zblocks.load() / (double) std::max<long long>(z.blocks.load(), 1));
+            }
+        });
+    return on;
+}();
+void count_zeros(const int8_t* q, int64_t n) {
+    long long z0 = 0, z1 = 0, z3 = 0, zb = 0;
+    for (int64_t b = 0; b < n / 32; ++b) {
+        int c = 0;
+        for (int i = 0; i < 32; ++i) {
+            const int v = std::abs((int) q[b * 32 + i]);
+            c += v == 0;
+            z1 += v <= 1;
+            z3 += v <= 3;
+        }
+        z0 += c;
+        zb += c == 32;
+    }
+    ZeroStats& z = g_zs[n > 1024 ? 0 : 1];
+    z.rows += 1; z.vals += n; z.z0 += z0; z.z1 += z1; z.z3 += z3; z.blocks += n / 32; z.zblocks += zb;
+}
+}  // namespace
+
 void quantize_act(const float* x, int64_t n, void* act) {
     const ref::Act a = ref::act_view(act, n);
     const __m256 sign = _mm256_set1_ps(-0.0f);
@@ -288,6 +331,7 @@ void quantize_act(const float* x, int64_t n, void* act) {
         a.s[b] = amax / 127.0f;
         a.b[b] = _mm_cvtsi128_si32(s4);
     }
+    if (g_zero_stats) count_zeros(a.q, n);
 }
 
 void gate_up_rows(const ExpertFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* out, int r0, int r1) {
