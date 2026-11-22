@@ -580,6 +580,22 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
   endif()
 
+  # Gemma 4 26B A4B (GGUF architecture gemma4), src/gemma4.  Its routed-expert kernels give the same bits on the CPU and
+  # on the GPU (the contract is in src/gemma4/g4_fmt.hpp), so: the CPU file gets the AVX2 flavour's flags and no
+  # contraction, and the CUDA files no implicit fused multiply-add (their fmaf() calls are the contract's).
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND STRATA_CPU_X86)
+    if(MSVC)
+      set_source_files_properties(src/gemma4/g4_cpu.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    else()
+      set_source_files_properties(src/gemma4/g4_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-mavxvnni;-ffp-contract=off")
+    endif()
+    set_source_files_properties(src/gemma4/g4_kernel_test.cu PROPERTIES COMPILE_OPTIONS "-fmad=false")
+    # g4-kernel-test: the contract checked bit for bit on real expert rows (reference, AVX2, CUDA), and timed
+    add_executable(g4-kernel-test src/gemma4/g4_kernel_test.cu src/gemma4/g4_cpu.cpp)
+    target_include_directories(g4-kernel-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+    target_link_libraries(g4-kernel-test PRIVATE ${_strata_gpu_runtime_target})
+  endif()
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)
