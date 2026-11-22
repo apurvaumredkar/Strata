@@ -17,6 +17,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <thread>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -114,6 +116,7 @@ int main(int argc, char** argv) {
     std::string model;
     int layer = 0, n_exp = 4, T = 4;
     bool bench = false;
+    int mt = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i], v = argv[i + 1];
         if (a == "--model") model = v;
@@ -121,6 +124,7 @@ int main(int argc, char** argv) {
         else if (a == "--experts") n_exp = std::atoi(v.c_str());
         else if (a == "--rows") T = std::atoi(v.c_str());
         else if (a == "--bench") bench = std::atoi(v.c_str()) != 0;
+        else if (a == "--mt") mt = std::atoi(v.c_str());
         else {
             std::fprintf(stderr, "g4-kernel-test: unknown option %s\n", a.c_str());
             return 2;
@@ -207,6 +211,53 @@ int main(int argc, char** argv) {
             if (a == a && b == b && std::isfinite(a) && std::isfinite(b)) one((float) (0.5 * ((double) a + (double) b)));
         }
         check(bad == 0, "reference fp32 -> fp16 equals F16C", std::to_string(bad) + " of " + std::to_string(n) + " differ");
+    }
+
+    if (mt > 0) {
+        // --mt N: N threads, each running whole experts (one row, then `T` rows) over all of the layer's experts in turn,
+        // straight from the mapped file's tensors copied to an unpinned arena: the CPU path's throughput ceiling
+        const size_t all = f.stride * (size_t) n_expert;
+        uint8_t* arena = (uint8_t*) _aligned_malloc(all, 4096);
+        for (int e = 0; e < n_expert; ++e) {
+            std::memcpy(arena + (size_t) e * f.stride, src_g + (size_t) e * f.gu_bytes, f.gu_bytes);
+            std::memcpy(arena + (size_t) e * f.stride + f.down_off, src_d + (size_t) e * f.d_bytes, f.d_bytes);
+        }
+        std::vector<uint8_t> ax(g4::act_bytes(n_embd) * (size_t) T);
+        for (int t = 0; t < T; ++t) g4::cpu::quantize_act(x.data() + (size_t) t * n_embd, n_embd, ax.data() + (size_t) t * g4::act_bytes(n_embd));
+        std::printf("\nmulti-thread throughput over all %d experts of the layer (%.0f MB), whole experts, one per task\n", n_expert, all / 1e6);
+        for (int nt : {1, T}) {
+            std::vector<int> counts;
+            for (int n = 1; n <= mt; n = n < 4 ? n + 1 : n + 4) counts.push_back(n);
+            if (counts.back() != mt) counts.push_back(mt);
+            for (int n : counts) {
+                std::atomic<int> next{0};
+                const int passes = 3;
+                const auto t0 = Clock::now();
+                std::vector<std::thread> th;
+                for (int w = 0; w < n; ++w)
+                    th.emplace_back([&, w] {
+                        g4::cpu::Scratch scr;
+                        std::vector<float> out((size_t) nt * n_embd);
+                        const void* act[g4::cpu::kMaxTok];
+                        float* o[g4::cpu::kMaxTok];
+                        for (int t = 0; t < nt; ++t) {
+                            act[t] = ax.data() + (size_t) t * g4::act_bytes(n_embd);
+                            o[t] = out.data() + (size_t) t * n_embd;
+                        }
+                        for (;;) {
+                            const int i = next.fetch_add(1);
+                            if (i >= passes * n_expert) break;
+                            g4::cpu::expert(f, arena + (size_t) (i % n_expert) * f.stride, act, nt, o, scr);
+                        }
+                    });
+                for (auto& t : th) t.join();
+                const double ms = ms_since(t0);
+                std::printf("  %2d thread(s), %d row(s): %.1f GB/s of expert bytes (%.3f ms per expert per thread)\n", n, nt,
+                            (double) passes * all / 1e6 / ms, ms * n / (passes * n_expert));
+            }
+        }
+        _aligned_free(arena);
+        return 0;
     }
 
     // ---- device state
