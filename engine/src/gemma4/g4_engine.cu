@@ -17,7 +17,8 @@
 //
 // Modes: --tokens-file F [--n N] generates greedily and prints "prompt:" / "gen:" lines (the interface of
 // tools/oracle/g4-oracle, so the two can be compared), with --top2 / --full-logits dumps and --force-file teacher
-// forcing; --bench-json F writes the timings.
+// forcing; --jobs-file F [--reps R] runs several requests one after the other in one process (the expert cache
+// carries over, as in a server); --bench-json F writes every request's timings and tokens.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/gemma4/engine.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -715,8 +716,8 @@ std::vector<int32_t> read_ids(const std::string& path, const char* key) {
 }  // namespace
 
 int strata::gemma4::run(int argc, char** argv) {
-    std::string model, tokens_file, force_file, top2_file, full_file, bench_json;
-    int n_gen = 32, ctx = 4096, threads = 0, slots = -1, dev = 0;
+    std::string model, tokens_file, force_file, top2_file, full_file, bench_json, jobs_file;
+    int n_gen = 32, ctx = 4096, threads = 0, slots = -1, dev = 0, reps = 1;
     double vram_mib = -1;
     Engine E;
     for (int i = 1; i < argc; ++i) {
@@ -731,6 +732,8 @@ int strata::gemma4::run(int argc, char** argv) {
         else if (a == "--top2") top2_file = val();
         else if (a == "--full-logits") full_file = val();
         else if (a == "--bench-json") bench_json = val();
+        else if (a == "--jobs-file") jobs_file = val();
+        else if (a == "--reps") reps = std::atoi(val().c_str());
         else if (a == "--n") n_gen = std::atoi(val().c_str());
         else if (a == "--ctx") ctx = std::atoi(val().c_str());
         else if (a == "--threads") threads = std::atoi(val().c_str());
@@ -746,19 +749,46 @@ int strata::gemma4::run(int argc, char** argv) {
         else if (a == "--help" || a == "-h") {
             std::printf("strata-g4 --model GGUF --tokens-file F [--n N] [--ctx 4096] [--threads N] [--slots S | --expert-vram-mib M]\n"
                         "          [--adapt 0|1] [--promote-min X] [--up-max N] [--decay X] [--decay-every N] [--profile 0|1]\n"
-                        "          [--force-file F] [--top2 F] [--full-logits F] [--bench-json F] [--device N]\n");
+                        "          [--force-file F] [--top2 F] [--full-logits F] [--bench-json F] [--device N]\n"
+                        "          [--jobs-file F [--reps R]]   lines: <id> <tokens file> <new tokens> [<forced ids file>]\n");
             return 0;
         } else die("unknown option " + a + " (see --help)");
     }
-    if (model.empty() || tokens_file.empty()) die("--model and --tokens-file are required (see --help)");
+    if (model.empty() || (tokens_file.empty() && jobs_file.empty())) die("--model and --tokens-file (or --jobs-file) are required (see --help)");
     if (!g4::cpu::available()) die("this CPU has no AVX2 + FMA + F16C");
     CK(cudaSetDevice(dev));
     CK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
-    std::vector<int32_t> prompt = read_ids(tokens_file, "prompt");
-    if (prompt.empty()) die("no token ids in " + tokens_file);
-    const std::vector<int32_t> forced = force_file.empty() ? std::vector<int32_t>() : read_ids(force_file, "gen");
-    if (!forced.empty()) n_gen = (int) forced.size() + 1;
-    if ((int) prompt.size() + n_gen > ctx) die("the prompt and the new tokens do not fit the context");
+    // the requests: one (--tokens-file), or the lines of --jobs-file: <id> <tokens file> <new tokens> [<forced ids file>]
+    struct Job {
+        std::string id;
+        std::vector<int32_t> prompt, forced;
+        int n_gen = 0;
+    };
+    std::vector<Job> jobs;
+    auto add_job = [&](const std::string& id, const std::string& tf, int n, const std::string& ff) {
+        Job j;
+        j.id = id;
+        j.prompt = read_ids(tf, "prompt");
+        if (j.prompt.empty()) die("no token ids in " + tf);
+        if (!ff.empty()) j.forced = read_ids(ff, "gen");
+        j.n_gen = j.forced.empty() ? n : (int) j.forced.size() + 1;
+        if ((int) j.prompt.size() + j.n_gen > ctx) die(id + ": the prompt and the new tokens do not fit the context");
+        jobs.push_back(std::move(j));
+    };
+    if (!jobs_file.empty()) {
+        std::istringstream in(read_file(jobs_file));
+        std::string line;
+        while (std::getline(in, line)) {
+            std::istringstream ls(line);
+            std::string id, tf, ff;
+            int n = 0;
+            if (!(ls >> id >> tf >> n) || id[0] == '#') continue;
+            ls >> ff;
+            add_job(id, tf, n, ff);
+        }
+        if (jobs.empty()) die("no jobs in " + jobs_file);
+    } else add_job("single", tokens_file, n_gen, force_file);
+    const bool single = jobs_file.empty();
 
     Model M;
     load(model, M);
@@ -784,72 +814,92 @@ int strata::gemma4::run(int argc, char** argv) {
             std::fwrite(rec, 4, 4, f_top2);
         }
     };
+    FILE* f_json = bench_json.empty() ? nullptr : std::fopen(bench_json.c_str(), "wb");
+    if (f_json)
+        std::fprintf(f_json, "{\"slots\": %d, \"threads\": %d, \"host_works\": %s, \"context\": %d, \"runs\": [\n", M.layers[0].n_slots,
+                     E.pool->workers(), E.pool->host_works() ? "true" : "false", ctx);
+    bool first_run = true;
+    for (int rep = 0; rep < reps; ++rep)
+        for (const Job& job : jobs) {
+            const std::vector<int32_t>& prompt = job.prompt;
+            const int ng = job.n_gen;
+            E.pos = 0;   // a new conversation; the expert cache keeps what it learned
+            E.next_decay = 0;
+            E.stats.reset();
+            if (single) {
+                std::printf("prompt:");
+                for (int32_t t : prompt) std::printf(" %d", t);
+                std::printf("\n");
+            }
+            // the prompt, kTmax rows at a time
+            const auto t_prompt = Clock::now();
+            int32_t next = 0;
+            for (size_t at = 0; at < prompt.size(); at += kTmax) {
+                const int T = (int) std::min<size_t>(kTmax, prompt.size() - at);
+                const bool last = at + T >= prompt.size();
+                E.forward(prompt.data() + at, T, last);
+                E.pos += T;
+                if (last) {
+                    next = E.h_amax[T - 1];
+                    dump(T - 1);
+                }
+            }
+            const double prompt_ms = ms_since(t_prompt);
+            const Stats prompt_stats = E.stats;
+            E.stats.reset();
+            for (double& v : E.prof) v = 0;
 
-    std::printf("prompt:");
-    for (int32_t t : prompt) std::printf(" %d", t);
-    std::printf("\n");
-
-    // the prompt, kTmax rows at a time
-    const auto t_prompt = Clock::now();
-    int32_t next = 0;
-    for (size_t at = 0; at < prompt.size(); at += kTmax) {
-        const int T = (int) std::min<size_t>(kTmax, prompt.size() - at);
-        const bool last = at + T >= prompt.size();
-        E.forward(prompt.data() + at, T, last);
-        E.pos += T;
-        if (last) {
-            next = E.h_amax[T - 1];
-            dump(T - 1);
+            std::vector<int32_t> gen;
+            gen.push_back(next);
+            const auto t_gen = Clock::now();
+            for (int i = 0; i + 1 < ng; ++i) {
+                const int32_t tok = job.forced.empty() ? next : job.forced[(size_t) i];
+                E.forward(&tok, 1, true);
+                E.pos += 1;
+                next = E.h_amax[0];
+                gen.push_back(next);
+                dump(0);
+            }
+            const double gen_ms = ms_since(t_gen);
+            if (single) {
+                std::printf("gen:");
+                for (int32_t t : gen) std::printf(" %d", t);
+                std::printf("\n");
+                std::fflush(stdout);
+            }
+            const Stats& s = E.stats;
+            const double tok_s = ng > 1 ? (ng - 1) * 1000.0 / gen_ms : 0.0;
+            const double hit = s.ent_gpu + s.ent_cpu ? (double) s.ent_gpu / (double) (s.ent_gpu + s.ent_cpu) : 0.0;
+            const double pp = s.passes ? (double) s.passes : 1.0;
+            std::fprintf(stderr, "strata-g4: [%s rep %d] prompt %zu tokens in %.1f ms (%.1f tok/s); decode %d tokens in %.1f ms = "
+                         "%.2f tok/s (%.2f ms per pass)\n", job.id.c_str(), rep, prompt.size(), prompt_ms,
+                         prompt.size() * 1000.0 / prompt_ms, ng - 1, gen_ms, tok_s, gen_ms / pp);
+            std::fprintf(stderr, "strata-g4:   decode experts: %.1f%% on the GPU (%lld of %lld picks), CPU pool %.2f ms per pass in "
+                         "%.1f jobs, wait for routing %.2f ms, plan %.2f ms per pass; %lld experts copied to VRAM (prompt: %.1f%% on "
+                         "the GPU, %lld copied)\n", 100.0 * hit, s.ent_gpu, s.ent_gpu + s.ent_cpu, s.ms_cpu / pp, (double) s.cpu_jobs / pp,
+                         s.ms_wait_route / pp, s.ms_plan / pp, s.uploads,
+                         prompt_stats.ent_gpu + prompt_stats.ent_cpu
+                             ? 100.0 * prompt_stats.ent_gpu / (double) (prompt_stats.ent_gpu + prompt_stats.ent_cpu) : 0.0,
+                         prompt_stats.uploads);
+            if (E.profile && s.passes)
+                std::fprintf(stderr, "strata-g4:   profile per pass: attention %.2f ms, FFN block (router, dense, experts, tail) "
+                             "%.2f ms, head %.2f ms\n", E.prof[0] / pp, E.prof[1] / pp, E.prof[2] / pp);
+            if (f_json) {
+                std::fprintf(f_json, "%s{\"id\": \"%s\", \"rep\": %d, \"prompt_tokens\": %zu, \"prompt_ms\": %.3f, \"decode_tokens\": %d, "
+                             "\"decode_ms\": %.3f, \"decode_tok_s\": %.4f, \"passes\": %lld, \"gpu_pick_share\": %.5f, "
+                             "\"cpu_ms_per_pass\": %.4f, \"wait_route_ms_per_pass\": %.4f, \"plan_ms_per_pass\": %.4f, \"uploads\": %lld, "
+                             "\"prompt_uploads\": %lld, \"gen\": [", first_run ? "" : ",\n", job.id.c_str(), rep, prompt.size(), prompt_ms,
+                             ng - 1, gen_ms, tok_s, s.passes, hit, s.ms_cpu / pp, s.ms_wait_route / pp, s.ms_plan / pp, s.uploads,
+                             prompt_stats.uploads);
+                for (size_t i = 0; i < gen.size(); ++i) std::fprintf(f_json, "%s%d", i ? ", " : "", gen[i]);
+                std::fprintf(f_json, "]}");
+                std::fflush(f_json);
+                first_run = false;
+            }
         }
-    }
-    const double prompt_ms = ms_since(t_prompt);
-    const Stats prompt_stats = E.stats;
-    E.stats.reset();
-    for (double& v : E.prof) v = 0;
-
-    std::vector<int32_t> gen;
-    gen.push_back(next);
-    const auto t_gen = Clock::now();
-    for (int i = 0; i + 1 < n_gen; ++i) {
-        const int32_t tok = forced.empty() ? next : forced[(size_t) i];
-        E.forward(&tok, 1, true);
-        E.pos += 1;
-        next = E.h_amax[0];
-        gen.push_back(next);
-        dump(0);
-    }
-    const double gen_ms = ms_since(t_gen);
-    std::printf("gen:");
-    for (int32_t t : gen) std::printf(" %d", t);
-    std::printf("\n");
-    std::fflush(stdout);
-
-    const Stats& s = E.stats;
-    const double tok_s = n_gen > 1 ? (n_gen - 1) * 1000.0 / gen_ms : 0.0;
-    const double hit = s.ent_gpu + s.ent_cpu ? (double) s.ent_gpu / (double) (s.ent_gpu + s.ent_cpu) : 0.0;
-    std::fprintf(stderr, "strata-g4: prompt %zu tokens in %.1f ms (%.1f tok/s); decode %d tokens in %.1f ms = %.2f tok/s "
-                 "(%.2f ms per pass)\n", prompt.size(), prompt_ms, prompt.size() * 1000.0 / prompt_ms, n_gen - 1, gen_ms, tok_s,
-                 s.passes ? gen_ms / s.passes : 0.0);
-    std::fprintf(stderr, "strata-g4: decode experts: %.1f%% on the GPU (%lld of %lld picks), CPU pool %.2f ms per pass in %.1f "
-                 "jobs, wait for routing %.2f ms, plan %.2f ms per pass; %lld experts copied to VRAM (prompt: %.1f%% on the GPU, "
-                 "%lld copied)\n", 100.0 * hit, s.ent_gpu, s.ent_gpu + s.ent_cpu, s.passes ? s.ms_cpu / s.passes : 0.0,
-                 s.passes ? (double) s.cpu_jobs / s.passes : 0.0, s.passes ? s.ms_wait_route / s.passes : 0.0,
-                 s.passes ? s.ms_plan / s.passes : 0.0, s.uploads,
-                 prompt_stats.ent_gpu + prompt_stats.ent_cpu
-                     ? 100.0 * prompt_stats.ent_gpu / (double) (prompt_stats.ent_gpu + prompt_stats.ent_cpu) : 0.0,
-                 prompt_stats.uploads);
-    if (E.profile && s.passes)
-        std::fprintf(stderr, "strata-g4: profile per pass: attention %.2f ms, FFN block (router, dense, experts, tail) %.2f ms, "
-                     "head %.2f ms\n", E.prof[0] / s.passes, E.prof[1] / s.passes, E.prof[2] / s.passes);
-    if (!bench_json.empty()) {
-        FILE* f = std::fopen(bench_json.c_str(), "wb");
-        if (f) {
-            std::fprintf(f, "{\"prompt_tokens\": %zu, \"prompt_ms\": %.3f, \"decode_tokens\": %d, \"decode_ms\": %.3f, "
-                         "\"decode_tok_s\": %.4f, \"passes\": %lld, \"gpu_pick_share\": %.5f, \"cpu_ms_per_pass\": %.4f, "
-                         "\"uploads\": %lld, \"slots\": %d, \"threads\": %d}\n", prompt.size(), prompt_ms, n_gen - 1, gen_ms, tok_s,
-                         s.passes, hit, s.passes ? s.ms_cpu / s.passes : 0.0, s.uploads, M.layers[0].n_slots, E.pool->workers());
-            std::fclose(f);
-        }
+    if (f_json) {
+        std::fprintf(f_json, "\n]}\n");
+        std::fclose(f_json);
     }
     if (f_top2) std::fclose(f_top2);
     if (f_full) std::fclose(f_full);
