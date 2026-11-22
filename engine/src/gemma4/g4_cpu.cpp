@@ -101,33 +101,31 @@ inline float reduce8(__m256 a) {
     return _mm_cvtss_f32(_mm_add_ss(l2, h2));
 }
 /// 8 x int32: the sums of 4 adjacent products u8 * s8 (|product pair sums| stay inside int16 for every weight type here).
-inline __m256i dot32(__m256i wu, __m256i xs, bool vnni) {
+template <bool VNNI>
+inline __m256i dot32(__m256i wu, __m256i xs) {
 #if defined(__AVXVNNI__) || defined(_MSC_VER)
-    if (vnni) return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wu, xs);
-#else
-    (void) vnni;
+    if (VNNI) return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wu, xs);
 #endif
     return _mm256_madd_epi16(_mm256_maddubs_epi16(wu, xs), _mm256_set1_epi16(1));
 }
 
 /// The 8 scales and 8 mins of a K super-block as int32 lanes (ggml's get_scale_min_k4 for j = 0..7).
 inline void k_scales(const uint8_t* scales, __m256i& sc, __m256i& mn) {
+    // in registers all the way: a vector load of bytes that scalar stores just wrote cannot be forwarded and stalls
     constexpr uint32_t kmask1 = 0x3f3f3f3fu, kmask2 = 0x0f0f0f0fu, kmask3 = 0x03030303u;
-    uint32_t u[4];
-    std::memcpy(u, scales, 12);
-    u[3] = ((u[2] >> 4) & kmask2) | (((u[1] >> 6) & kmask3) << 4);
-    const uint32_t aux = u[1] & kmask1;
-    u[1] = (u[2] & kmask2) | (((u[0] >> 6) & kmask3) << 4);
-    u[2] = aux;
-    u[0] &= kmask1;
-    sc = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) &u[0]));
-    mn = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) &u[2]));
+    uint32_t u0, u1, u2;
+    std::memcpy(&u0, scales, 4);
+    std::memcpy(&u1, scales + 4, 4);
+    std::memcpy(&u2, scales + 8, 4);
+    const uint64_t s8 = ((uint64_t) ((u2 & kmask2) | (((u0 >> 6) & kmask3) << 4)) << 32) | (u0 & kmask1);
+    const uint64_t m8 = ((uint64_t) (((u2 >> 4) & kmask2) | (((u1 >> 6) & kmask3) << 4)) << 32) | (u1 & kmask1);
+    sc = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128((long long) s8));
+    mn = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128((long long) m8));
 }
 
-template <bool Q5>
+template <bool Q5, bool VNNI>
 void gate_up_rows_k(const ExpertFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* out, int r0,
                     int r1) {
-    const bool vnni = caps().vnni;
     const int nb = f.n_embd / 256;
     const size_t blk = Q5 ? sizeof(BlockQ5K) : sizeof(BlockQ4K);
     const __m256i m4 = _mm256_set1_epi8(0x0F), one8 = _mm256_set1_epi8(1);
@@ -166,7 +164,7 @@ void gate_up_rows_k(const ExpertFmt& f, const uint8_t* blob, const void* const* 
             for (int t = 0; t < nt; ++t) {
                 const int8_t* qx = a[t].q + (size_t) B * 256;
                 __m256i p[8];
-                for (int j = 0; j < 8; ++j) p[j] = dot32(w[j], _mm256_loadu_si256((const __m256i*) (qx + 32 * j)), vnni);
+                for (int j = 0; j < 8; ++j) p[j] = dot32<VNNI>(w[j], _mm256_loadu_si256((const __m256i*) (qx + 32 * j)));
                 const __m256i I = hsum8x8(p);
                 const __m256 t1 = _mm256_cvtepi32_ps(_mm256_mullo_epi32(sc, I));
                 const __m256 t2 = _mm256_cvtepi32_ps(_mm256_mullo_epi32(mn, _mm256_loadu_si256((const __m256i*) (a[t].b + B * 8))));
@@ -186,10 +184,9 @@ inline __m256i bytes_from_bits_32(uint32_t x32) {
     return _mm256_cmpeq_epi8(bytes, _mm256_set1_epi64x(-1));
 }
 
-template <bool Q8>
+template <bool Q8, bool VNNI>
 void down_rows_32(const ExpertFmt& f, const uint8_t* blob, const void* const* act_h, int nt, float* const* out, int r0,
                   int r1) {
-    const bool vnni = caps().vnni;
     const int nb = f.n_ff / 32;
     const size_t blk = Q8 ? sizeof(BlockQ80) : sizeof(BlockQ51);
     const __m256i m4 = _mm256_set1_epi8(0x0F), b16 = _mm256_set1_epi8(0x10);
@@ -197,6 +194,8 @@ void down_rows_32(const ExpertFmt& f, const uint8_t* blob, const void* const* ac
     for (int t = 0; t < nt; ++t) a[t] = ref::act_view(const_cast<void*>(act_h[t]), f.n_ff);
     const uint8_t* base = blob + f.down_off;
     alignas(32) static const int32_t kLaneMask[16] = {-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0};
+    const int ib = (int) blk;
+    const __m256i goff = _mm256_setr_epi32(0, ib, 2 * ib, 3 * ib, 4 * ib, 5 * ib, 6 * ib, 7 * ib);
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = base + (size_t) r * f.d_row;
         __m256 acc[kMaxTok];
@@ -204,7 +203,11 @@ void down_rows_32(const ExpertFmt& f, const uint8_t* blob, const void* const* ac
         for (int g = 0; g < nb; g += 8) {
             const int n = nb - g < 8 ? nb - g : 8;   // blocks in this group (the lanes past n add exact zeros)
             const __m256i lane = _mm256_loadu_si256((const __m256i*) (kLaneMask + 8 - n));
-            alignas(32) uint16_t hd[8] = {0, 0, 0, 0, 0, 0, 0, 0}, hm[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            // the 8 blocks' first 4 bytes (Q5_1: d | m << 16; Q8_0: d and two weights) in one masked gather, then two
+            // fp16 -> float conversions; no bytes go through the stack
+            const __m256i hdr = _mm256_mask_i32gather_epi32(_mm256_setzero_si256(), (const int*) (row + (size_t) g * blk), goff, lane, 1);
+            const __m256i dm = _mm256_permute4x64_epi64(
+                _mm256_packus_epi32(_mm256_and_si256(hdr, _mm256_set1_epi32(0xffff)), _mm256_srli_epi32(hdr, 16)), 0xD8);
             __m256i w[8], sg[8];
             for (int j = 0; j < 8; ++j) {
                 if (j >= n) {
@@ -213,13 +216,11 @@ void down_rows_32(const ExpertFmt& f, const uint8_t* blob, const void* const* ac
                     continue;
                 }
                 const uint8_t* b = row + (size_t) (g + j) * blk;
-                std::memcpy(&hd[j], b, 2);
                 if (Q8) {
                     const __m256i q = _mm256_loadu_si256((const __m256i*) (b + 2));
                     w[j] = _mm256_abs_epi8(q);   // |w| as u8; the sign goes to the activation (maddubs wants u8 * s8)
                     sg[j] = q;
                 } else {
-                    std::memcpy(&hm[j], b + 2, 2);
                     uint32_t qh;
                     std::memcpy(&qh, b + 4, 4);
                     const __m128i nib = _mm_loadu_si128((const __m128i*) (b + 8));
@@ -227,8 +228,8 @@ void down_rows_32(const ExpertFmt& f, const uint8_t* blob, const void* const* ac
                     w[j] = _mm256_or_si256(lohi, _mm256_and_si256(bytes_from_bits_32(qh), b16));
                 }
             }
-            const __m256 dv = _mm256_cvtph_ps(_mm_load_si128((const __m128i*) hd));
-            const __m256 mv = _mm256_cvtph_ps(_mm_load_si128((const __m128i*) hm));
+            const __m256 dv = _mm256_cvtph_ps(_mm256_castsi256_si128(dm));
+            const __m256 mv = _mm256_cvtph_ps(_mm256_extracti128_si256(dm, 1));   // (Q8_0: unused)
             for (int t = 0; t < nt; ++t) {
                 const int8_t* qx = a[t].q + (size_t) g * 32;
                 __m256i p[8];
@@ -238,7 +239,7 @@ void down_rows_32(const ExpertFmt& f, const uint8_t* blob, const void* const* ac
                         continue;
                     }
                     const __m256i x = _mm256_loadu_si256((const __m256i*) (qx + 32 * j));
-                    p[j] = Q8 ? dot32(w[j], _mm256_sign_epi8(x, sg[j]), vnni) : dot32(w[j], x, vnni);
+                    p[j] = Q8 ? dot32<VNNI>(w[j], _mm256_sign_epi8(x, sg[j])) : dot32<VNNI>(w[j], x);
                 }
                 const __m256 fi = _mm256_cvtepi32_ps(hsum8x8(p));
                 const __m256 pr = _mm256_mul_ps(dv, fi);
@@ -290,13 +291,15 @@ void quantize_act(const float* x, int64_t n, void* act) {
 }
 
 void gate_up_rows(const ExpertFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* out, int r0, int r1) {
-    if (f.gu_type == kTypeQ5_K) gate_up_rows_k<true>(f, blob, act, nt, out, r0, r1);
-    else gate_up_rows_k<false>(f, blob, act, nt, out, r0, r1);
+    const bool q5 = f.gu_type == kTypeQ5_K;
+    if (caps().vnni) q5 ? gate_up_rows_k<true, true>(f, blob, act, nt, out, r0, r1) : gate_up_rows_k<false, true>(f, blob, act, nt, out, r0, r1);
+    else q5 ? gate_up_rows_k<true, false>(f, blob, act, nt, out, r0, r1) : gate_up_rows_k<false, false>(f, blob, act, nt, out, r0, r1);
 }
 
 void down_rows(const ExpertFmt& f, const uint8_t* blob, const void* const* act_h, int nt, float* const* out, int r0, int r1) {
-    if (f.d_type == kTypeQ8_0) down_rows_32<true>(f, blob, act_h, nt, out, r0, r1);
-    else down_rows_32<false>(f, blob, act_h, nt, out, r0, r1);
+    const bool q8 = f.d_type == kTypeQ8_0;
+    if (caps().vnni) q8 ? down_rows_32<true, true>(f, blob, act_h, nt, out, r0, r1) : down_rows_32<false, true>(f, blob, act_h, nt, out, r0, r1);
+    else q8 ? down_rows_32<true, false>(f, blob, act_h, nt, out, r0, r1) : down_rows_32<false, false>(f, blob, act_h, nt, out, r0, r1);
 }
 
 void geglu_quantize(const float* gate_up, int n_ff, float* h, void* act_h) {
