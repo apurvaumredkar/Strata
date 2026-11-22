@@ -273,6 +273,41 @@ __global__ void k_ffn_out(const float* x1, const float* mlp, const float* parts_
     for (int i = threadIdx.x; i < n; i += blockDim.x) x[off + i] = ((x[off + i] * rc) * w_post[i] + x1[off + i]) * out_scale;
 }
 
+/// The drafter's block, first half: x1 = x + rms(o) * w_post, m = rms(x1) * w_ffn.  grid T, block 256.
+__global__ void k_res_norm2(const float* x, const float* o, const float* w_post, const float* w_ffn, float* x1, float* m, int n,
+                            float eps) {
+    __shared__ float sh[kThreads];
+    const size_t off = (size_t) blockIdx.x * n;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += o[off + i] * o[off + i];
+    s = block_sum(s, sh);
+    const float ro = 1.0f / sqrtf(s / (float) n + eps);
+    s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = (o[off + i] * ro) * w_post[i] + x[off + i];
+        x1[off + i] = v;
+        s += v * v;
+    }
+    s = block_sum(s, sh);
+    const float r1 = 1.0f / sqrtf(s / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) m[off + i] = (x1[off + i] * r1) * w_ffn[i];
+}
+/// The drafter's block, second half: x = (rms(f) * w + x1) * out_scale.  grid T, block 256.
+__global__ void k_res_tail(const float* x1, const float* f, const float* w, float out_scale, float* x, int n, float eps) {
+    __shared__ float sh[kThreads];
+    const size_t off = (size_t) blockIdx.x * n;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += f[off + i] * f[off + i];
+    s = block_sum(s, sh);
+    const float r = 1.0f / sqrtf(s / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) x[off + i] = ((f[off + i] * r) * w[i] + x1[off + i]) * out_scale;
+}
+/// dst[i] = src[i].
+__global__ void k_copy(const float* src, float* dst, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
 /// Argmax of rows of n floats (the lower index wins a tie), two stages: stage 1 grid (kArgBlocks, T) block 256 writes
 /// each block's best into pv / pi [T][kArgBlocks]; stage 2 grid T block kArgBlocks picks the row's.
 constexpr int kArgBlocks = 64;

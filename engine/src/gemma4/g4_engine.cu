@@ -117,6 +117,27 @@ struct Model {
     size_t expert_bytes = 0, dense_bytes = 0;
 };
 
+/// Gemma 4's assistant model (GGUF architecture gemma4-assistant): a few attention + dense-FFN blocks that read the
+/// MAIN model's attention cache (its last sliding-window layer and its last global layer) and predict the tokens after
+/// the one just sampled.  Its input is that token's main-model embedding joined with a hidden state: the main model's
+/// final normed state for the first draft, then its own.  Every draft is checked by the main model, so nothing here
+/// has to be exact.
+struct DraftLayer {
+    bool swa = true;
+    int H = 16, HD = 256;
+    float *attn_norm = nullptr, *q_norm = nullptr, *post_attn_norm = nullptr, *ffn_norm = nullptr, *post_ffw_norm = nullptr;
+    float out_scale = 1.0f;
+    Mat wq, wo, ffn_gate, ffn_up, ffn_down;
+};
+struct Drafter {
+    bool on = false;
+    int n_embd = 0, n_ff = 0, n_out = 0;
+    std::vector<DraftLayer> layers;
+    float* out_norm = nullptr;
+    Mat embd, pre, post;
+    size_t bytes = 0;
+};
+
 float* upload_f32(const strata::GgufModel& gm, const std::string& name, uint64_t want, std::vector<float>* host = nullptr) {
     size_t s = 0;
     const strata::TensorInfo* t = gm.find(name, &s);
@@ -280,6 +301,87 @@ void load(const std::string& path, Model& m) {
                  ms_since(t0) / 1000.0);
 }
 
+/// The assistant file beside the model (the first .gguf in its folder whose architecture is gemma4-assistant), or "".
+std::string find_assistant(const std::string& model_path) {
+#ifdef _WIN32
+    const size_t cut = model_path.find_last_of("/\\");
+    const std::string dir = cut == std::string::npos ? std::string(".") : model_path.substr(0, cut);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\*.gguf").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    std::string found;
+    do {
+        const std::string path = dir + "\\" + fd.cFileName;
+        try {
+            strata::GgufFile f(path);
+            const strata::MetaValue* arch = f.get("general.architecture");
+            if (arch && arch->s == "gemma4-assistant") {
+                found = path;
+                break;
+            }
+        } catch (...) {
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return found;
+#else
+    (void) model_path;
+    return {};
+#endif
+}
+
+void load_drafter(const std::string& path, const Model& m, Drafter& d) {
+    strata::GgufModel gm = strata::GgufModel::open(path);
+    const strata::MetaValue* arch = gm.meta().get("general.architecture");
+    if (!arch || arch->s != "gemma4-assistant") die(path + " is not a gemma4-assistant file");
+    const std::string p = "gemma4-assistant.";
+    const int nl = (int) meta_u(gm, p + "block_count");
+    d.n_embd = (int) meta_u(gm, p + "embedding_length");
+    d.n_ff = (int) meta_u(gm, p + "feed_forward_length");
+    d.n_out = (int) meta_u(gm, p + "embedding_length_out");
+    const int n_head = (int) meta_u(gm, p + "attention.head_count");
+    const int hd = (int) meta_u(gm, p + "attention.key_length"), hd_swa = (int) meta_u(gm, p + "attention.key_length_swa");
+    const strata::MetaValue* swp = gm.meta().get(p + "attention.sliding_window_pattern");
+    if (!swp || (int) swp->items.size() != nl) die("the assistant's sliding_window_pattern is missing");
+    if (d.n_out != m.n_embd || hd != m.hd || hd_swa != m.hd_swa || d.n_embd % 32 || d.n_ff % 32)
+        die("the assistant does not belong to this model (widths differ)");
+    if (m.n_layer < 2 || !m.layers[(size_t) m.n_layer - 2].swa || m.layers[(size_t) m.n_layer - 1].swa)
+        die("the assistant reads the main model's last sliding-window and last global layer, which this model does not end with");
+    size_t bytes = 0;
+    d.embd = upload_mat(gm, "token_embd.weight", d.n_embd, m.n_vocab, bytes);
+    d.pre = upload_mat(gm, "nextn.pre_projection.weight", 2 * m.n_embd, d.n_embd, bytes);
+    d.post = upload_mat(gm, "nextn.post_projection.weight", d.n_embd, m.n_embd, bytes);
+    d.out_norm = upload_f32(gm, "output_norm.weight", (uint64_t) d.n_embd);
+    d.layers.resize((size_t) nl);
+    for (int l = 0; l < nl; ++l) {
+        DraftLayer& y = d.layers[(size_t) l];
+        auto nm = [&](const char* s) { return "blk." + std::to_string(l) + "." + s; };
+        y.swa = swp->items[(size_t) l].u != 0;
+        y.H = n_head;
+        y.HD = y.swa ? hd_swa : hd;
+        const Layer& main = m.layers[(size_t) (y.swa ? m.n_layer - 2 : m.n_layer - 1)];
+        if (main.H != y.H || main.HD != y.HD) die("the assistant's heads do not match the main model's cache");
+        const uint64_t N = (uint64_t) d.n_embd;
+        y.attn_norm = upload_f32(gm, nm("attn_norm.weight"), N);
+        y.q_norm = upload_f32(gm, nm("attn_q_norm.weight"), (uint64_t) y.HD);
+        y.post_attn_norm = upload_f32(gm, nm("post_attention_norm.weight"), N);
+        y.ffn_norm = upload_f32(gm, nm("ffn_norm.weight"), N);
+        y.post_ffw_norm = upload_f32(gm, nm("post_ffw_norm.weight"), N);
+        std::vector<float> os;
+        CK(cudaFree(upload_f32(gm, nm("layer_output_scale.weight"), 1, &os)));
+        y.out_scale = os[0];
+        y.wq = upload_mat(gm, nm("attn_q.weight"), d.n_embd, y.H * y.HD, bytes);
+        y.wo = upload_mat(gm, nm("attn_output.weight"), y.H * y.HD, d.n_embd, bytes);
+        y.ffn_gate = upload_mat(gm, nm("ffn_gate.weight"), d.n_embd, d.n_ff, bytes);
+        y.ffn_up = upload_mat(gm, nm("ffn_up.weight"), d.n_embd, d.n_ff, bytes);
+        y.ffn_down = upload_mat(gm, nm("ffn_down.weight"), d.n_ff, d.n_embd, bytes);
+    }
+    d.bytes = bytes;
+    d.on = true;
+    std::fprintf(stderr, "strata-g4: drafter %s: %d blocks of %d, %.2f GiB on the GPU\n", path.c_str(), nl, d.n_embd,
+                 (double) bytes / (1 << 30));
+}
+
 // ------------------------------------------------------------------------------------------------ the engine
 template <class T> T* dalloc(size_t n) {
     T* p = nullptr;
@@ -385,6 +487,17 @@ struct Engine {
     int split_below = 0, split_tasks = 3;
     std::vector<int16_t> idx_of;   // per expert: its group (>= 0) or job (<= -2) of the layer being planned, -1: none
     Stats stats;
+    // the drafter (when loaded): its buffers, one row
+    const Drafter* dr = nullptr;
+    float *d_xh = nullptr, *d_x = nullptr, *d_n = nullptr, *d_qv = nullptr, *d_q = nullptr, *d_att = nullptr, *d_o = nullptr,
+          *d_x1 = nullptr, *d_m = nullptr, *d_gate = nullptr, *d_up = nullptr, *d_hd = nullptr, *d_f = nullptr, *d_hn = nullptr,
+          *d_logits = nullptr, *hprev = nullptr;
+    void *d_xq = nullptr, *d_hq = nullptr;
+    int32_t *d_tok = nullptr, *d_meta = nullptr, *h_meta = nullptr, *h_draft = nullptr;
+    float2 *d_cs_swa = nullptr, *d_cs_glb = nullptr;
+    int draft_n = 3;
+    long long drafts_made = 0, drafts_kept = 0;
+    double ms_draft = 0;
     // the cache's policy (see adapt())
     bool adapt_on = true;
     float promote_min = 2.0f, decay = 0.5f;
@@ -470,6 +583,104 @@ struct Engine {
         pool = std::make_unique<C::ExpertPool>(threads, true, true);
         std::fprintf(stderr, "strata-g4: context %d, sliding ring %d cells, CPU pool %d workers%s, AVX-VNNI %s\n", ctx, ring,
                      pool->workers(), pool->host_works() ? " + the host thread" : "", g4::cpu::have_avx_vnni() ? "yes" : "no");
+    }
+
+    void init_drafter(const Drafter& d) {
+        dr = &d;
+        const size_t N = (size_t) d.n_embd, V = (size_t) m->n_vocab;
+        size_t qd = 0;
+        for (const DraftLayer& y : d.layers) qd = std::max(qd, (size_t) y.H * y.HD);
+        d_xh = dalloc<float>(2 * (size_t) m->n_embd);
+        d_x = dalloc<float>(N);
+        d_n = dalloc<float>(N);
+        d_qv = dalloc<float>(qd);
+        d_q = dalloc<float>(qd);
+        d_att = dalloc<float>(qd);
+        d_o = dalloc<float>(N);
+        d_x1 = dalloc<float>(N);
+        d_m = dalloc<float>(N);
+        d_gate = dalloc<float>((size_t) d.n_ff);
+        d_up = dalloc<float>((size_t) d.n_ff);
+        d_hd = dalloc<float>((size_t) d.n_ff);
+        d_f = dalloc<float>(N);
+        d_hn = dalloc<float>(N);
+        d_logits = dalloc<float>(V);
+        hprev = dalloc<float>((size_t) m->n_embd);
+        const size_t qn = std::max(std::max(qd, N), 2 * (size_t) m->n_embd);
+        CK(cudaMalloc(&d_xq, K::native_q8_1_bytes((int) qn, 1) + 64));
+        CK(cudaMalloc(&d_hq, K::native_q8_1_bytes(d.n_ff, 1) + 64));
+        d_tok = dalloc<int32_t>(kTmax + 1);
+        d_meta = dalloc<int32_t>(8);
+        h_meta = halloc<int32_t>(8);
+        h_draft = halloc<int32_t>(kTmax + 1);
+        d_cs_swa = dalloc<float2>((size_t) m->hd_swa / 2);
+        d_cs_glb = dalloc<float2>((size_t) m->hd / 2);
+    }
+
+    /// Drafts `nd` tokens that may follow `tok`, the token of cell `pos` (sampled, not processed yet), starting from the
+    /// hidden state in `hprev` (the main model's final normed state of the last kept row).  They land in h_draft[0, nd).
+    /// The drafter reads the main model's attention cache as it stands (cells below `pos`); every step runs at
+    /// position `pos`.
+    void draft(int32_t tok, int nd) {
+        const Drafter& d = *dr;
+        const auto t0 = Clock::now();
+        const int N = d.n_embd, NM = m->n_embd, p = (int) pos;
+        const int cnt_s = std::min(p, m->n_swa - 1);
+        h_meta[0] = tok;
+        h_meta[1] = p;
+        h_meta[2] = (p - cnt_s) % ring;   // first visible sliding cell
+        h_meta[3] = cnt_s;
+        h_meta[4] = 0;
+        h_meta[5] = p;                    // visible global cells
+        CK(cudaMemcpyAsync(d_meta, h_meta, 8 * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_tok, h_meta, 4, cudaMemcpyHostToDevice, st));   // the first step's token
+        G::k_rope_tab<<<1, (unsigned) (m->hd_swa / 2), 0, st>>>(d_meta + 1, nullptr, d_cs_swa, m->hd_swa,
+                                                              std::pow(m->rope_base_swa, -2.0f / (float) m->hd_swa));
+        G::k_rope_tab<<<1, (unsigned) (m->hd / 2), 0, st>>>(d_meta + 1, m->rope_freqs, d_cs_glb, m->hd,
+                                                          std::pow(m->rope_base, -2.0f / (float) m->hd));
+        const Layer& ks = m->layers[(size_t) m->n_layer - 2];
+        const Layer& kg = m->layers[(size_t) m->n_layer - 1];
+        for (int sidx = 0; sidx < nd; ++sidx) {
+            // [the token's main-model embedding | the hidden state] -> the drafter's width
+            G::k_embed<<<dim3((unsigned) (NM / 32), 1), 32, 0, st>>>(m->embd.d, d_tok + sidx, d_xh, NM, std::sqrt((float) NM));
+            G::k_copy<<<(unsigned) ((NM + G::kThreads - 1) / G::kThreads), G::kThreads, 0, st>>>(hprev, d_xh + NM, NM);
+            K::native_quantize_q8_1(d_xh, d_xq, 2 * NM, 1, st);
+            K::native_mmvq(d.pre.type, d.pre.d, d_xq, d_x, 2 * NM, N, 1, st);
+            for (const DraftLayer& y : d.layers) {
+                const Layer& kv = y.swa ? ks : kg;
+                const int QD = y.H * y.HD;
+                G::k_rms_w<<<1, G::kThreads, 0, st>>>(d_x, y.attn_norm, d_n, N, m->eps);
+                K::native_quantize_q8_1(d_n, d_xq, N, 1, st);
+                K::native_mmvq(y.wq.type, y.wq.d, d_xq, d_qv, N, QD, 1, st);
+                // queries only: the grid stops at the query heads, the cache is the main model's
+                G::k_attn_prep<<<dim3((unsigned) y.H, 1), G::kThreads, 0, st>>>(d_qv, nullptr, nullptr, y.q_norm, nullptr,
+                                                                              y.swa ? d_cs_swa : d_cs_glb, d_q, nullptr, nullptr,
+                                                                              nullptr, y.H, kv.HKV, y.HD, kv.cap, m->eps);
+                G::k_attn<<<dim3((unsigned) y.H, 1), G::kThreads, 0, st>>>(d_q, kv.kc, kv.vc, y.swa ? d_meta + 2 : d_meta + 4,
+                                                                         y.swa ? d_meta + 3 : d_meta + 5, sc, d_att, y.H, kv.HKV,
+                                                                         y.HD, kv.cap);
+                K::native_quantize_q8_1(d_att, d_xq, QD, 1, st);
+                K::native_mmvq(y.wo.type, y.wo.d, d_xq, d_o, QD, N, 1, st);
+                G::k_res_norm2<<<1, G::kThreads, 0, st>>>(d_x, d_o, y.post_attn_norm, y.ffn_norm, d_x1, d_m, N, m->eps);
+                K::native_quantize_q8_1(d_m, d_xq, N, 1, st);
+                K::native_mmvq(y.ffn_gate.type, y.ffn_gate.d, d_xq, d_gate, N, d.n_ff, 1, st);
+                K::native_mmvq(y.ffn_up.type, y.ffn_up.d, d_xq, d_up, N, d.n_ff, 1, st);
+                G::k_geglu_dense<<<(unsigned) ((d.n_ff + G::kThreads - 1) / G::kThreads), G::kThreads, 0, st>>>(d_gate, d_up, tab, d_hd,
+                                                                                                              (int64_t) d.n_ff);
+                K::native_quantize_q8_1(d_hd, d_hq, d.n_ff, 1, st);
+                K::native_mmvq(y.ffn_down.type, y.ffn_down.d, d_hq, d_f, d.n_ff, N, 1, st);
+                G::k_res_tail<<<1, G::kThreads, 0, st>>>(d_x1, d_f, y.post_ffw_norm, y.out_scale, d_x, N, m->eps);
+            }
+            G::k_rms_w<<<1, G::kThreads, 0, st>>>(d_x, d.out_norm, d_hn, N, m->eps);
+            K::native_quantize_q8_1(d_hn, d_xq, N, 1, st);
+            K::native_mmvq(d.embd.type, d.embd.d, d_xq, d_logits, N, m->n_vocab, 1, st);
+            G::k_argmax1<<<dim3(G::kArgBlocks, 1), G::kThreads, 0, st>>>(d_logits, m->n_vocab, pv, pi);
+            G::k_argmax2<<<1, G::kArgBlocks, 0, st>>>(pv, pi, d_tok + sidx + 1, nullptr);
+            if (sidx + 1 < nd) K::native_mmvq(d.post.type, d.post.d, d_xq, hprev, N, NM, 1, st);   // the next step's hidden state
+        }
+        CK(cudaMemcpyAsync(h_draft, d_tok + 1, (size_t) nd * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        ms_draft += ms_since(t0);
     }
 
     /// The expert slots: `slots` per layer (-1: what fits in `vram_mib`, or in the free VRAM less a reserve), the first
@@ -777,7 +988,7 @@ std::vector<int32_t> read_ids(const std::string& path, const char* key) {
 }  // namespace
 
 int strata::gemma4::run(int argc, char** argv) {
-    std::string model, tokens_file, force_file, top2_file, full_file, bench_json, jobs_file;
+    std::string model, tokens_file, force_file, top2_file, full_file, bench_json, jobs_file, draft_file;
     int n_gen = 32, ctx = 4096, threads = 0, slots = -1, dev = 0, reps = 1;
     double vram_mib = -1;
     Engine E;
@@ -794,6 +1005,8 @@ int strata::gemma4::run(int argc, char** argv) {
         else if (a == "--full-logits") full_file = val();
         else if (a == "--bench-json") bench_json = val();
         else if (a == "--jobs-file") jobs_file = val();
+        else if (a == "--draft") draft_file = val();
+        else if (a == "--draft-n") E.draft_n = std::atoi(val().c_str());
         else if (a == "--reps") reps = std::atoi(val().c_str());
         else if (a == "--n") n_gen = std::atoi(val().c_str());
         else if (a == "--ctx") ctx = std::atoi(val().c_str());
@@ -813,7 +1026,8 @@ int strata::gemma4::run(int argc, char** argv) {
             std::printf("strata-g4 --model GGUF --tokens-file F [--n N] [--ctx 4096] [--threads N] [--slots S | --expert-vram-mib M]\n"
                         "          [--adapt 0|1] [--promote-min X] [--up-max N] [--decay X] [--decay-every N] [--profile 0|1]\n"
                         "          [--force-file F] [--top2 F] [--full-logits F] [--bench-json F] [--device N]\n"
-                        "          [--jobs-file F [--reps R]]   lines: <id> <tokens file> <new tokens> [<forced ids file>]\n");
+                        "          [--jobs-file F [--reps R]]   lines: <id> <tokens file> <new tokens> [<forced ids file>]\n"
+                        "          [--draft GGUF|none] [--draft-n 0..7]   the assistant model (default: the one beside the model)\n");
             return 0;
         } else die("unknown option " + a + " (see --help)");
     }
@@ -855,7 +1069,15 @@ int strata::gemma4::run(int argc, char** argv) {
 
     Model M;
     load(model, M);
+    Drafter D;
+    if (draft_file != "none" && E.draft_n > 0) {
+        if (draft_file.empty()) draft_file = find_assistant(model);
+        if (!draft_file.empty()) load_drafter(draft_file, M, D);
+        else std::fprintf(stderr, "strata-g4: no gemma4-assistant file beside the model: no drafts\n");
+    }
+    E.draft_n = std::max(0, std::min(E.draft_n, kTmax - 1));
     E.init(M, ctx, threads);
+    if (D.on) E.init_drafter(D);
     E.place(slots, vram_mib);
     const C::ThreadAffinity aff = C::pin_current_thread(C::planned_host_core());
     (void) aff;
@@ -905,6 +1127,7 @@ int strata::gemma4::run(int argc, char** argv) {
                 if (last) {
                     next = E.h_amax[T - 1];
                     dump(T - 1);
+                    if (E.dr) CK(cudaMemcpyAsync(E.hprev, E.hfin + (size_t) (T - 1) * M.n_embd, (size_t) M.n_embd * 4, cudaMemcpyDeviceToDevice, E.st));
                 }
             }
             const double prompt_ms = ms_since(t_prompt);
@@ -915,13 +1138,39 @@ int strata::gemma4::run(int argc, char** argv) {
             std::vector<int32_t> gen;
             gen.push_back(next);
             const auto t_gen = Clock::now();
-            for (int i = 0; i + 1 < ng; ++i) {
-                const int32_t tok = job.forced.empty() ? next : job.forced[(size_t) i];
-                E.forward(&tok, 1, true);
-                E.pos += 1;
-                next = E.h_amax[0];
-                gen.push_back(next);
-                dump(0);
+            const bool drafting = E.dr && job.forced.empty() && !f_top2 && !f_full;
+            E.drafts_made = E.drafts_kept = 0;
+            E.ms_draft = 0;
+            if (drafting) {
+                // guess, then check: the drafter proposes up to draft_n tokens after `next`; one forward runs `next` and
+                // the proposals as consecutive rows; row r's own prediction is valid while every proposal before it was
+                // right, and the rows up to the first wrong proposal are kept
+                int32_t rows[kTmax];
+                while ((int) gen.size() < ng) {
+                    const int room = std::min(ctx - (int) E.pos - 1, ng - (int) gen.size() - 1);
+                    const int nd = std::max(0, std::min(E.draft_n, room));
+                    if (nd > 0) E.draft(next, nd);
+                    rows[0] = next;
+                    for (int d = 0; d < nd; ++d) rows[d + 1] = E.h_draft[d];
+                    E.forward(rows, 1 + nd, true);
+                    int acc = 0;
+                    while (acc < nd && rows[acc + 1] == E.h_amax[acc]) ++acc;
+                    for (int r = 0; r <= acc && (int) gen.size() < ng; ++r) gen.push_back(E.h_amax[r]);
+                    E.pos += 1 + acc;
+                    next = E.h_amax[acc];
+                    E.drafts_made += nd;
+                    E.drafts_kept += acc;
+                    CK(cudaMemcpyAsync(E.hprev, E.hfin + (size_t) acc * M.n_embd, (size_t) M.n_embd * 4, cudaMemcpyDeviceToDevice, E.st));
+                }
+            } else {
+                for (int i = 0; i + 1 < ng; ++i) {
+                    const int32_t tok = job.forced.empty() ? next : job.forced[(size_t) i];
+                    E.forward(&tok, 1, true);
+                    E.pos += 1;
+                    next = E.h_amax[0];
+                    gen.push_back(next);
+                    dump(0);
+                }
             }
             const double gen_ms = ms_since(t_gen);
             if (single) {
@@ -944,6 +1193,10 @@ int strata::gemma4::run(int argc, char** argv) {
                          prompt_stats.ent_gpu + prompt_stats.ent_cpu
                              ? 100.0 * prompt_stats.ent_gpu / (double) (prompt_stats.ent_gpu + prompt_stats.ent_cpu) : 0.0,
                          prompt_stats.uploads);
+            if (drafting)
+                std::fprintf(stderr, "strata-g4:   drafts: %lld of %lld kept (%.1f%%), %.2f tokens per pass, drafter %.2f ms per pass\n",
+                             E.drafts_kept, E.drafts_made, E.drafts_made ? 100.0 * E.drafts_kept / (double) E.drafts_made : 0.0,
+                             (double) (ng - 1) / pp, E.ms_draft / pp);
             if (E.profile && s.passes)
                 std::fprintf(stderr, "strata-g4:   profile per pass: attention %.2f ms, FFN block (router, dense, experts, tail) "
                              "%.2f ms, head %.2f ms\n", E.prof[0] / pp, E.prof[1] / pp, E.prof[2] / pp);
@@ -951,9 +1204,10 @@ int strata::gemma4::run(int argc, char** argv) {
                 std::fprintf(f_json, "%s{\"id\": \"%s\", \"rep\": %d, \"prompt_tokens\": %zu, \"prompt_ms\": %.3f, \"decode_tokens\": %d, "
                              "\"decode_ms\": %.3f, \"decode_tok_s\": %.4f, \"passes\": %lld, \"gpu_pick_share\": %.5f, "
                              "\"cpu_ms_per_pass\": %.4f, \"wait_route_ms_per_pass\": %.4f, \"plan_ms_per_pass\": %.4f, \"uploads\": %lld, "
-                             "\"prompt_uploads\": %lld, \"gen\": [", first_run ? "" : ",\n", job.id.c_str(), rep, prompt.size(), prompt_ms,
+                             "\"prompt_uploads\": %lld, \"drafts_made\": %lld, \"drafts_kept\": %lld, \"draft_ms_per_pass\": %.4f, \"gen\": [",
+                             first_run ? "" : ",\n", job.id.c_str(), rep, prompt.size(), prompt_ms,
                              ng - 1, gen_ms, tok_s, s.passes, hit, s.ms_cpu / pp, s.ms_wait_route / pp, s.ms_plan / pp, s.uploads,
-                             prompt_stats.uploads);
+                             prompt_stats.uploads, E.drafts_made, E.drafts_kept, E.ms_draft / pp);
                 for (size_t i = 0; i < gen.size(); ++i) std::fprintf(f_json, "%s%d", i ? ", " : "", gen[i]);
                 std::fprintf(f_json, "]}");
                 std::fflush(f_json);
