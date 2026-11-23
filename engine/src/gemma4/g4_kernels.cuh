@@ -46,6 +46,20 @@ __global__ void k_embed(const uint8_t* embd, const int32_t* tok, float* x, int n
     x[(size_t) blockIdx.y * n + blockIdx.x * 32 + threadIdx.x] = (d * (float) (int8_t) b[2 + threadIdx.x]) * scale;
 }
 
+/// The same for a Q6_K table (blocks of 256 weights in 210 bytes: ql[128], qh[64], 16 int8 scales, d): ggml's
+/// dequantize_row_q6_K, x[t] = ((d * sc) * (q - 32)) * scale.  grid (n / 32, T), block 32, n a multiple of 256.
+__global__ void k_embed_q6k(const uint8_t* embd, const int32_t* tok, float* x, int n, float scale) {
+    const int v = blockIdx.x * 32 + threadIdx.x, k = v & 255, hf = k >> 7, qd = (k & 127) >> 5, l = k & 31;
+    const uint8_t* b = embd + ((size_t) tok[blockIdx.y] * (size_t) (n / 256) + (size_t) (v >> 8)) * 210;
+    const uint8_t* ql = b + 64 * hf;
+    const unsigned qh = b[128 + 32 * hf + l];
+    const unsigned lo = ql[l + 32 * (qd & 1)];
+    const int q = (int) (((qd & 2) ? lo >> 4 : lo & 0xF) | (((qh >> (2 * qd)) & 3) << 4)) - 32;
+    const float sc = (float) (int8_t) b[192 + 8 * hf + (l >> 4) + 2 * qd];
+    const float d = __half2float(__ushort_as_half((unsigned short) (b[208] | (b[209] << 8))));
+    x[(size_t) blockIdx.y * n + v] = ((d * sc) * (float) q) * scale;
+}
+
 /// y[t] = rms(x[t]) * w.  grid T, block 256.
 __global__ void k_rms_w(const float* x, const float* w, float* y, int n, float eps) {
     __shared__ float sh[kThreads];

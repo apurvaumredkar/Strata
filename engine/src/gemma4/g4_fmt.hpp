@@ -18,6 +18,10 @@
 //   Q4_K / Q5_K  value = d * sc * q - dmin * m          term = fma(-dmin, float(m * bsum), d * float(sc * I))
 //   Q5_1         value = d * q + m                      term = fma(m, float(bsum), d * float(I))
 //   Q8_0         value = d * q                          term = d * float(I)
+//   IQ3_XXS      value = db * g * sign                  term = db * float(I), db = (d * (0.5 + ls)) * 0.5, with g the
+//                                                       grid's weight (4 .. 62), ls the sub-block's 4-bit scale
+//   IQ4_XS       value = d * (ls - 32) * k[q]           term = d * float((ls - 32) * I), k the 16 IQ4_NL weights
+//   IQ4_NL       value = d * k[q]                       term = d * float(I)
 // Every int -> float conversion above is exact (the products stay below 2^24).  No fused multiply-add other than the
 // ones written, on either device: the CUDA file is compiled with -fmad=false, the CPU file uses the intrinsics.
 #pragma once
@@ -35,7 +39,8 @@
 namespace strata::gemma4 {
 
 // ggml type ids (the GGUF file format)
-constexpr int kTypeF32 = 0, kTypeQ5_1 = 7, kTypeQ8_0 = 8, kTypeQ4_K = 12, kTypeQ5_K = 13;
+constexpr int kTypeF32 = 0, kTypeQ5_1 = 7, kTypeQ8_0 = 8, kTypeQ4_K = 12, kTypeQ5_K = 13, kTypeQ6_K = 14,
+              kTypeIQ3_XXS = 18, kTypeIQ4_NL = 20, kTypeIQ4_XS = 23;
 
 #pragma pack(push, 1)
 struct BlockQ4K {      // 256 weights
@@ -58,11 +63,34 @@ struct BlockQ80 {      // 32 weights
     uint16_t d;
     int8_t qs[32];
 };
+struct BlockIQ3XXS {   // 256 weights: 64 grid indices (4 weights each), then a word per 32 weights: 4 x 7 sign bits, 4 scale bits
+    uint16_t d;
+    uint8_t qs[64];
+    uint8_t ss[32];
+};
+struct BlockIQ4XS {    // 256 weights: 8 sub-blocks of 32 with a 6-bit scale (4 bits in scales_l, 2 in scales_h)
+    uint16_t d, scales_h;
+    uint8_t scales_l[4];
+    uint8_t qs[128];
+};
+struct BlockIQ4NL {    // 32 weights
+    uint16_t d;
+    uint8_t qs[16];
+};
+struct BlockQ6K {      // 256 weights (the token embedding of some files; not an expert type)
+    uint8_t ql[128], qh[64];
+    int8_t scales[16];
+    uint16_t d;
+};
 #pragma pack(pop)
 static_assert(sizeof(BlockQ4K) == 144, "block_q4_K");
 static_assert(sizeof(BlockQ5K) == 176, "block_q5_K");
 static_assert(sizeof(BlockQ51) == 24, "block_q5_1");
 static_assert(sizeof(BlockQ80) == 34, "block_q8_0");
+static_assert(sizeof(BlockIQ3XXS) == 98, "block_iq3_xxs");
+static_assert(sizeof(BlockIQ4XS) == 136, "block_iq4_xs");
+static_assert(sizeof(BlockIQ4NL) == 18, "block_iq4_nl");
+static_assert(sizeof(BlockQ6K) == 210, "block_q6_K");
 
 /// Bytes of a row of `n` weights of ggml type `t` (0: a type the expert kernels do not take, or n not whole blocks).
 G4_HD constexpr size_t row_bytes(int t, int64_t n) {
@@ -70,10 +98,18 @@ G4_HD constexpr size_t row_bytes(int t, int64_t n) {
          : t == kTypeQ5_K ? (n % 256 ? 0 : (size_t) (n / 256) * sizeof(BlockQ5K))
          : t == kTypeQ5_1 ? (n % 32 ? 0 : (size_t) (n / 32) * sizeof(BlockQ51))
          : t == kTypeQ8_0 ? (n % 32 ? 0 : (size_t) (n / 32) * sizeof(BlockQ80))
+         : t == kTypeIQ3_XXS ? (n % 256 ? 0 : (size_t) (n / 256) * sizeof(BlockIQ3XXS))
+         : t == kTypeIQ4_XS ? (n % 256 ? 0 : (size_t) (n / 256) * sizeof(BlockIQ4XS))
+         : t == kTypeIQ4_NL ? (n % 32 ? 0 : (size_t) (n / 32) * sizeof(BlockIQ4NL))
          : 0;
 }
-constexpr bool gate_up_type_ok(int t) { return t == kTypeQ4_K || t == kTypeQ5_K; }
-constexpr bool down_type_ok(int t) { return t == kTypeQ5_1 || t == kTypeQ8_0; }
+constexpr bool gate_up_type_ok(int t) { return t == kTypeQ4_K || t == kTypeQ5_K || t == kTypeIQ3_XXS || t == kTypeIQ4_XS; }
+constexpr bool down_type_ok(int t) { return t == kTypeQ5_1 || t == kTypeQ8_0 || t == kTypeIQ4_NL; }
+
+/// The 6-bit scale of sub-block j (0..7) of an IQ4_XS super-block, less 32 (ggml's dequantize_row_iq4_xs).
+G4_HD inline int iq4xs_scale(int j, unsigned scales_h, const uint8_t* scales_l) {
+    return (int) (((scales_l[j / 2] >> (4 * (j % 2))) & 0xF) | (((scales_h >> (2 * j)) & 3) << 4)) - 32;
+}
 
 /// The 6-bit scale and min of sub-block j (0..7) of a K super-block (ggml's get_scale_min_k4).
 G4_HD inline void k4_scale_min(int j, const uint8_t* q, int& sc, int& m) {

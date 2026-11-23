@@ -94,6 +94,58 @@ void dequant_row(int type, const uint8_t* row, int n, double* y) {
                 y[b * 32 + j + 16] = ((w[b].qs[j] >> 4) | (((qh >> (j + 16)) & 1u) << 4)) * d + m;
             }
         }
+    } else if (type == g4::kTypeIQ3_XXS) {   // ggml's dequantize_row_iq3_xxs
+        for (int B = 0; B < n / 256; ++B) {
+            const uint8_t* b = row + (size_t) B * 98;
+            uint16_t hd;
+            std::memcpy(&hd, b, 2);
+            const double d = fp16_to_fp32(hd);
+            const uint8_t* qs = b + 2;
+            const uint8_t* sas = qs + 64;
+            for (int ib = 0; ib < 8; ++ib) {
+                uint32_t aux32;
+                std::memcpy(&aux32, sas + 4 * ib, 4);
+                const double db = d * (0.5 + (aux32 >> 28)) * 0.5;
+                for (int l = 0; l < 4; ++l) {
+                    const uint8_t signs = g4::kIqSigns[(aux32 >> 7 * l) & 127];
+                    const uint8_t* grid1 = (const uint8_t*) (g4::kIq3xxsGrid + qs[2 * l + 0]);
+                    const uint8_t* grid2 = (const uint8_t*) (g4::kIq3xxsGrid + qs[2 * l + 1]);
+                    for (int j = 0; j < 4; ++j) {
+                        y[B * 256 + ib * 32 + l * 8 + j] = db * grid1[j] * ((signs >> j) & 1 ? -1.0 : 1.0);
+                        y[B * 256 + ib * 32 + l * 8 + j + 4] = db * grid2[j] * ((signs >> (j + 4)) & 1 ? -1.0 : 1.0);
+                    }
+                }
+                qs += 8;
+            }
+        }
+    } else if (type == g4::kTypeIQ4_XS) {    // ggml's dequantize_row_iq4_xs
+        for (int B = 0; B < n / 256; ++B) {
+            const uint8_t* b = row + (size_t) B * 136;
+            uint16_t hd, sh;
+            std::memcpy(&hd, b, 2);
+            std::memcpy(&sh, b + 2, 2);
+            const double d = fp16_to_fp32(hd);
+            for (int ib = 0; ib < 8; ++ib) {
+                const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4);
+                const double dl = d * (ls - 32);
+                const uint8_t* qs = b + 8 + 16 * ib;
+                for (int j = 0; j < 16; ++j) {
+                    y[B * 256 + ib * 32 + j] = dl * g4::kIq4nl[qs[j] & 0xf];
+                    y[B * 256 + ib * 32 + j + 16] = dl * g4::kIq4nl[qs[j] >> 4];
+                }
+            }
+        }
+    } else if (type == g4::kTypeIQ4_NL) {    // ggml's dequantize_row_iq4_nl
+        for (int b = 0; b < n / 32; ++b) {
+            const uint8_t* w = row + (size_t) b * 18;
+            uint16_t hd;
+            std::memcpy(&hd, w, 2);
+            const double d = fp16_to_fp32(hd);
+            for (int j = 0; j < 16; ++j) {
+                y[b * 32 + j] = d * g4::kIq4nl[w[2 + j] & 0xf];
+                y[b * 32 + j + 16] = d * g4::kIq4nl[w[2 + j] >> 4];
+            }
+        }
     } else {
         const g4::BlockQ80* w = (const g4::BlockQ80*) row;
         for (int b = 0; b < n / 32; ++b) {
@@ -295,15 +347,9 @@ int main(int argc, char** argv) {
     const g4::gpu::ActDev dax{d_ax, ax_stride, n_embd}, dah{d_ah, ah_stride, n_ff};
     auto gpu_all = [&]() {
         g4::gpu::k_quant_a8<<<dim3((unsigned) (n_embd / 32), (unsigned) T), 32, 0, st>>>(d_x, n_embd, dax);
-        if (f.gu_type == g4::kTypeQ5_K)
-            g4::gpu::k_gate_up<true><<<dim3((unsigned) (2 * n_ff / 32), (unsigned) n_exp), 128, 0, st>>>(d_groups, dax, d_gu, n_embd, n_ff);
-        else
-            g4::gpu::k_gate_up<false><<<dim3((unsigned) (2 * n_ff / 32), (unsigned) n_exp), 128, 0, st>>>(d_groups, dax, d_gu, n_embd, n_ff);
+        g4::gpu::launch_gate_up(f, d_groups, n_exp, dax, d_gu, st);
         g4::gpu::k_geglu_quant<<<dim3((unsigned) (n_ff / 32), (unsigned) n_ent), 32, 0, st>>>(d_ents, d_gu, d_tab, dah, n_ff);
-        if (f.d_type == g4::kTypeQ8_0)
-            g4::gpu::k_down<true><<<dim3((unsigned) (n_embd / 32), (unsigned) n_exp), 256, 0, st>>>(d_groups, dah, d_parts, f.down_off, n_embd, n_ff);
-        else
-            g4::gpu::k_down<false><<<dim3((unsigned) (n_embd / 32), (unsigned) n_exp), 256, 0, st>>>(d_groups, dah, d_parts, f.down_off, n_embd, n_ff);
+        g4::gpu::launch_down(f, d_groups, n_exp, dah, d_parts, st);
     };
     gpu_all();
     CK(cudaStreamSynchronize(st));

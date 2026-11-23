@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "g4_fmt.hpp"
+#include "g4_iq_tables.hpp"
 
 namespace strata::gemma4::ref {
 
@@ -204,11 +205,76 @@ inline float dot_q80(const uint8_t* row, int64_t n, const Act& a) {
     return reduce8(acc);
 }
 
+inline float dot_iq3xxs(const uint8_t* row, int64_t n, const Act& a) {
+    const BlockIQ3XXS* w = (const BlockIQ3XXS*) row;
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int64_t B = 0; B < n / 256; ++B) {
+        const float d = fp16_to_fp32(w[B].d);
+        for (int j = 0; j < 8; ++j) {
+            uint32_t aux;
+            std::memcpy(&aux, w[B].ss + 4 * j, 4);
+            const float db = (d * (0.5f + (float) (aux >> 28))) * 0.5f;
+            const int8_t* qx = a.q + B * 256 + j * 32;
+            int32_t I = 0;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t signs = kIqSigns[(aux >> (7 * l)) & 127];
+                for (int h = 0; h < 2; ++h) {
+                    const uint32_t g = kIq3xxsGrid[w[B].qs[8 * j + 2 * l + h]];
+                    for (int i = 0; i < 4; ++i) {
+                        const int32_t v = (int32_t) ((g >> (8 * i)) & 0xFF);
+                        I += ((signs >> (4 * h + i)) & 1 ? -v : v) * (int32_t) qx[8 * l + 4 * h + i];
+                    }
+                }
+            }
+            const float term = db * (float) I;
+            acc[j] = std::fma(a.s[B * 8 + j], term, acc[j]);
+        }
+    }
+    return reduce8(acc);
+}
+
+inline float dot_iq4xs(const uint8_t* row, int64_t n, const Act& a) {
+    const BlockIQ4XS* w = (const BlockIQ4XS*) row;
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int64_t B = 0; B < n / 256; ++B) {
+        const float d = fp16_to_fp32(w[B].d);
+        for (int j = 0; j < 8; ++j) {
+            const int ls = iq4xs_scale(j, w[B].scales_h, w[B].scales_l);
+            const uint8_t* qs = w[B].qs + 16 * j;
+            const int8_t* qx = a.q + B * 256 + j * 32;
+            int32_t I = 0;
+            for (int i = 0; i < 16; ++i)
+                I += (int32_t) kIq4nl[qs[i] & 0xF] * (int32_t) qx[i] + (int32_t) kIq4nl[qs[i] >> 4] * (int32_t) qx[i + 16];
+            const float term = d * (float) (ls * I);
+            acc[j] = std::fma(a.s[B * 8 + j], term, acc[j]);
+        }
+    }
+    return reduce8(acc);
+}
+
+inline float dot_iq4nl(const uint8_t* row, int64_t n, const Act& a) {
+    const BlockIQ4NL* w = (const BlockIQ4NL*) row;
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int64_t b = 0; b < n / 32; ++b) {
+        const float d = fp16_to_fp32(w[b].d);
+        const int8_t* qx = a.q + b * 32;
+        int32_t I = 0;
+        for (int i = 0; i < 16; ++i)
+            I += (int32_t) kIq4nl[w[b].qs[i] & 0xF] * (int32_t) qx[i] + (int32_t) kIq4nl[w[b].qs[i] >> 4] * (int32_t) qx[i + 16];
+        const float term = d * (float) I;
+        acc[b & 7] = std::fma(a.s[b], term, acc[b & 7]);
+    }
+    return reduce8(acc);
+}
+
 inline float dot(int type, const uint8_t* row, int64_t n, const Act& a) {
     switch (type) {
         case kTypeQ4_K: return dot_q4k(row, n, a);
         case kTypeQ5_K: return dot_q5k(row, n, a);
         case kTypeQ5_1: return dot_q51(row, n, a);
+        case kTypeIQ3_XXS: return dot_iq3xxs(row, n, a);
+        case kTypeIQ4_XS: return dot_iq4xs(row, n, a);
+        case kTypeIQ4_NL: return dot_iq4nl(row, n, a);
         default: return dot_q80(row, n, a);
     }
 }

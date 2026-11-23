@@ -259,6 +259,151 @@ void down_rows_32(const ExpertFmt& f, const uint8_t* blob, const void* const* ac
     }
 }
 
+/// 32 4-bit codes (one a byte) -> the IQ4_NL weights as int8.
+inline __m256i iq4nl_bytes(__m256i codes) {
+    const __m128i t = _mm_loadu_si128((const __m128i*) kIq4nl);
+    return _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(t), codes);
+}
+
+/// IQ3_XXS gate/up rows: a sub-block's 32 weights are 8 grid words (unsigned, 4 .. 62); their signs go to the
+/// activation (maddubs wants u8 * s8), as the Q8_0 down rows do it.
+template <bool VNNI>
+void gate_up_rows_iq3(const ExpertFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* out, int r0,
+                      int r1) {
+    const int nb = f.n_embd / 256;
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256i one8 = _mm256_set1_epi8(1);
+    ref::Act a[kMaxTok];
+    for (int t = 0; t < nt; ++t) a[t] = ref::act_view(const_cast<void*>(act[t]), f.n_embd);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = blob + (size_t) r * f.gu_row;
+        __m256 acc[kMaxTok];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm256_setzero_ps();
+        for (int B = 0; B < nb; ++B) {
+            const uint8_t* b = row + (size_t) B * sizeof(BlockIQ3XXS);
+            uint16_t hd;
+            std::memcpy(&hd, b, 2);
+            const __m256i aux = _mm256_loadu_si256((const __m256i*) (b + 2 + 64));
+            // db = (d * (0.5 + ls)) * 0.5, the reference's steps on 8 lanes
+            const __m256 db = _mm256_mul_ps(
+                _mm256_mul_ps(_mm256_set1_ps(h2f(hd)), _mm256_add_ps(half, _mm256_cvtepi32_ps(_mm256_srli_epi32(aux, 28)))), half);
+            alignas(32) uint32_t ax[8];
+            _mm256_store_si256((__m256i*) ax, aux);
+            __m256i w[8], sg[8];
+            for (int j = 0; j < 8; ++j) {
+                const __m256i idx = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) (b + 2 + 8 * j)));
+                w[j] = _mm256_i32gather_epi32((const int*) kIq3xxsGrid, idx, 4);
+                const uint32_t u = ax[j];
+                const uint32_t bits = (uint32_t) kIqSigns[u & 127] | ((uint32_t) kIqSigns[(u >> 7) & 127] << 8) |
+                                      ((uint32_t) kIqSigns[(u >> 14) & 127] << 16) | ((uint32_t) kIqSigns[(u >> 21) & 127] << 24);
+                sg[j] = _mm256_or_si256(bytes_from_bits_32(bits), one8);   // -1 where the weight is negative, else 1
+            }
+            for (int t = 0; t < nt; ++t) {
+                const int8_t* qx = a[t].q + (size_t) B * 256;
+                __m256i p[8];
+                for (int j = 0; j < 8; ++j)
+                    p[j] = dot32<VNNI>(w[j], _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) (qx + 32 * j)), sg[j]));
+                const __m256 term = _mm256_mul_ps(db, _mm256_cvtepi32_ps(hsum8x8(p)));
+                acc[t] = _mm256_fmadd_ps(_mm256_loadu_ps(a[t].s + B * 8), term, acc[t]);
+            }
+        }
+        for (int t = 0; t < nt; ++t) out[t][r] = reduce8(acc[t]);
+    }
+}
+
+/// IQ4_XS gate/up rows.
+template <bool VNNI>
+void gate_up_rows_iq4xs(const ExpertFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* out, int r0,
+                        int r1) {
+    const int nb = f.n_embd / 256;
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    ref::Act a[kMaxTok];
+    for (int t = 0; t < nt; ++t) a[t] = ref::act_view(const_cast<void*>(act[t]), f.n_embd);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = blob + (size_t) r * f.gu_row;
+        __m256 acc[kMaxTok];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm256_setzero_ps();
+        for (int B = 0; B < nb; ++B) {
+            const uint8_t* b = row + (size_t) B * sizeof(BlockIQ4XS);
+            uint16_t hd, sh;
+            std::memcpy(&hd, b, 2);
+            std::memcpy(&sh, b + 2, 2);
+            const __m256 dv = _mm256_set1_ps(h2f(hd));
+            alignas(32) int32_t lsa[8];
+            for (int j = 0; j < 8; ++j) lsa[j] = iq4xs_scale(j, sh, b + 4);
+            const __m256i ls = _mm256_load_si256((const __m256i*) lsa);
+            __m256i w[8], sg[8];
+            for (int j = 0; j < 8; ++j) {
+                const __m128i nib = _mm_loadu_si128((const __m128i*) (b + 8 + 16 * j));
+                const __m256i q = iq4nl_bytes(_mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(nib, 4), nib), m4));
+                w[j] = _mm256_abs_epi8(q);
+                sg[j] = q;   // never 0: the 16 weights are not
+            }
+            for (int t = 0; t < nt; ++t) {
+                const int8_t* qx = a[t].q + (size_t) B * 256;
+                __m256i p[8];
+                for (int j = 0; j < 8; ++j)
+                    p[j] = dot32<VNNI>(w[j], _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) (qx + 32 * j)), sg[j]));
+                const __m256 term = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(_mm256_mullo_epi32(ls, hsum8x8(p))));
+                acc[t] = _mm256_fmadd_ps(_mm256_loadu_ps(a[t].s + B * 8), term, acc[t]);
+            }
+        }
+        for (int t = 0; t < nt; ++t) out[t][r] = reduce8(acc[t]);
+    }
+}
+
+/// IQ4_NL down rows: 8 blocks of 32 a group, as down_rows_32.
+template <bool VNNI>
+void down_rows_iq4nl(const ExpertFmt& f, const uint8_t* blob, const void* const* act_h, int nt, float* const* out, int r0,
+                     int r1) {
+    const int nb = f.n_ff / 32;
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    ref::Act a[kMaxTok];
+    for (int t = 0; t < nt; ++t) a[t] = ref::act_view(const_cast<void*>(act_h[t]), f.n_ff);
+    const uint8_t* base = blob + f.down_off;
+    alignas(32) static const int32_t kLaneMask[16] = {-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = base + (size_t) r * f.d_row;
+        __m256 acc[kMaxTok];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm256_setzero_ps();
+        for (int g = 0; g < nb; g += 8) {
+            const int n = nb - g < 8 ? nb - g : 8;
+            const __m256i lane = _mm256_loadu_si256((const __m256i*) (kLaneMask + 8 - n));
+            alignas(16) uint16_t dh[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            __m256i w[8], sg[8];
+            for (int j = 0; j < 8; ++j) {
+                if (j >= n) {
+                    w[j] = _mm256_setzero_si256();
+                    sg[j] = _mm256_setzero_si256();
+                    continue;
+                }
+                const uint8_t* b = row + (size_t) (g + j) * sizeof(BlockIQ4NL);
+                std::memcpy(&dh[j], b, 2);
+                const __m128i nib = _mm_loadu_si128((const __m128i*) (b + 2));
+                const __m256i q = iq4nl_bytes(_mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(nib, 4), nib), m4));
+                w[j] = _mm256_abs_epi8(q);
+                sg[j] = q;
+            }
+            const __m256 dv = _mm256_cvtph_ps(_mm_load_si128((const __m128i*) dh));
+            for (int t = 0; t < nt; ++t) {
+                const int8_t* qx = a[t].q + (size_t) g * 32;
+                __m256i p[8];
+                for (int j = 0; j < 8; ++j) {
+                    if (j >= n) {
+                        p[j] = _mm256_setzero_si256();
+                        continue;
+                    }
+                    p[j] = dot32<VNNI>(w[j], _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) (qx + 32 * j)), sg[j]));
+                }
+                const __m256 term = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(hsum8x8(p)));
+                const __m256 sv = _mm256_and_ps(_mm256_loadu_ps(a[t].s + g), _mm256_castsi256_ps(lane));
+                acc[t] = _mm256_fmadd_ps(sv, term, acc[t]);
+            }
+        }
+        for (int t = 0; t < nt; ++t) out[t][r] = reduce8(acc[t]);
+    }
+}
+
 }  // namespace
 
 bool available() noexcept { return caps().avx2; }
@@ -335,12 +480,24 @@ void quantize_act(const float* x, int64_t n, void* act) {
 }
 
 void gate_up_rows(const ExpertFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* out, int r0, int r1) {
+    if (f.gu_type == kTypeIQ3_XXS) {
+        caps().vnni ? gate_up_rows_iq3<true>(f, blob, act, nt, out, r0, r1) : gate_up_rows_iq3<false>(f, blob, act, nt, out, r0, r1);
+        return;
+    }
+    if (f.gu_type == kTypeIQ4_XS) {
+        caps().vnni ? gate_up_rows_iq4xs<true>(f, blob, act, nt, out, r0, r1) : gate_up_rows_iq4xs<false>(f, blob, act, nt, out, r0, r1);
+        return;
+    }
     const bool q5 = f.gu_type == kTypeQ5_K;
     if (caps().vnni) q5 ? gate_up_rows_k<true, true>(f, blob, act, nt, out, r0, r1) : gate_up_rows_k<false, true>(f, blob, act, nt, out, r0, r1);
     else q5 ? gate_up_rows_k<true, false>(f, blob, act, nt, out, r0, r1) : gate_up_rows_k<false, false>(f, blob, act, nt, out, r0, r1);
 }
 
 void down_rows(const ExpertFmt& f, const uint8_t* blob, const void* const* act_h, int nt, float* const* out, int r0, int r1) {
+    if (f.d_type == kTypeIQ4_NL) {
+        caps().vnni ? down_rows_iq4nl<true>(f, blob, act_h, nt, out, r0, r1) : down_rows_iq4nl<false>(f, blob, act_h, nt, out, r0, r1);
+        return;
+    }
     const bool q8 = f.d_type == kTypeQ8_0;
     if (caps().vnni) q8 ? down_rows_32<true, true>(f, blob, act_h, nt, out, r0, r1) : down_rows_32<false, true>(f, blob, act_h, nt, out, r0, r1);
     else q8 ? down_rows_32<true, false>(f, blob, act_h, nt, out, r0, r1) : down_rows_32<false, false>(f, blob, act_h, nt, out, r0, r1);
