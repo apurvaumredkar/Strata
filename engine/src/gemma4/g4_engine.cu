@@ -496,6 +496,10 @@ struct Engine {
     int32_t *d_tok = nullptr, *d_meta = nullptr, *h_meta = nullptr, *h_draft = nullptr;
     float2 *d_cs_swa = nullptr, *d_cs_glb = nullptr;
     int draft_n = 7;
+    bool attn_shared = true;   // the attention that reads the cache once (k_attn_score / soft / value)
+    float* aiz = nullptr;
+    int attn_pb = 16;          // (row, query head) pairs a block of k_attn_score takes
+    int nu_s = 1, nu_g = 1;    // cells a forward's rows see between them in a window layer / a full layer
     // chaining by confidence (draft_more > 0): `sure` is the product of the drafter's probabilities of its guesses so far;
     // a guess is kept while sure >= draft_keep, and another is asked for while sure >= draft_more (up to draft_n)
     float draft_more = 0.98f, draft_keep = 0.5f;
@@ -618,11 +622,42 @@ struct Engine {
         h_meta = halloc<int32_t>(8);
         h_draft = halloc<int32_t>(kTmax + 1);
         d_dv = dalloc<float>(1);
+        aiz = dalloc<float>((size_t) kTmax * 64);
         d_ps = dalloc<float>(G::kArgBlocks);
         d_conf = dalloc<float>(1);
         h_conf = halloc<float>(1);
         d_cs_swa = dalloc<float2>((size_t) m->hd_swa / 2);
         d_cs_glb = dalloc<float2>((size_t) m->hd / 2);
+    }
+
+    /// softmax(q . k) v of T rows' query heads over a layer's cache (k_attn's result, bit for bit).
+    double att_ms[4] = {0, 0, 0, 0};   // --profile: score, softmax, value, the old kernel
+    void att_t(int k, Clock::time_point& t) {
+        if (!profile) return;
+        CK(cudaStreamSynchronize(st));
+        if (k >= 0) att_ms[k] += ms_since(t);
+        t = Clock::now();
+    }
+    void attend(const float* q_, const __half* kc_, const __half* vc_, const int32_t* first, const int32_t* count, float* out, int H,
+                int HKV, int HD, int cap, int T, int nu) {
+        const int hpg = HKV > 0 ? H / HKV : 0;
+        auto ta = Clock::now();
+        att_t(-1, ta);
+        if (!attn_shared || hpg < 1 || H % HKV || HD > 512 || HD % 8 || cap % 8 || H > 64) {
+            G::k_attn<<<dim3((unsigned) H, (unsigned) T), G::kThreads, 0, st>>>(q_, kc_, vc_, first, count, sc, out, H, HKV, HD, cap);
+            att_t(3, ta);
+            return;
+        }
+        const int PB = std::max(1, std::min(attn_pb, G::kAttnPairs));
+        const unsigned rc = (unsigned) ((T * hpg + PB - 1) / PB);
+        nu = std::max(1, std::min(nu, cap));
+        G::k_attn_score<<<dim3((unsigned) HKV, (unsigned) ((nu + G::kThreads - 1) / G::kThreads), rc), G::kThreads, 0, st>>>(
+            q_, kc_, first, count, sc, H, HKV, HD, cap, T, PB, nu);
+        att_t(0, ta);
+        G::k_attn_soft<<<dim3((unsigned) H, (unsigned) T), G::kThreads, 0, st>>>(first, count, sc, aiz, H, cap);
+        att_t(1, ta);
+        G::k_attn_value<<<dim3((unsigned) H, (unsigned) T), G::kThreads, 0, st>>>(vc_, first, count, sc, aiz, out, H, HKV, HD, cap);
+        att_t(2, ta);
     }
 
     /// Drafts `nd` tokens that may follow `tok`, the token of cell `pos` (sampled, not processed yet), starting from the
@@ -666,9 +701,8 @@ struct Engine {
                 G::k_attn_prep<<<dim3((unsigned) y.H, 1), G::kThreads, 0, st>>>(d_qv, nullptr, nullptr, y.q_norm, nullptr,
                                                                               y.swa ? d_cs_swa : d_cs_glb, d_q, nullptr, nullptr,
                                                                               nullptr, y.H, kv.HKV, y.HD, kv.cap, m->eps);
-                G::k_attn<<<dim3((unsigned) y.H, 1), G::kThreads, 0, st>>>(d_q, kv.kc, kv.vc, y.swa ? d_meta + 2 : d_meta + 4,
-                                                                         y.swa ? d_meta + 3 : d_meta + 5, sc, d_att, y.H, kv.HKV,
-                                                                         y.HD, kv.cap);
+                attend(d_q, kv.kc, kv.vc, y.swa ? d_meta + 2 : d_meta + 4, y.swa ? d_meta + 3 : d_meta + 5, d_att, y.H, kv.HKV, y.HD,
+                       kv.cap, 1, y.swa ? cnt_s : p);
                 K::native_quantize_q8_1(d_att, d_xq, QD, 1, st);
                 K::native_mmvq(y.wo.type, y.wo.d, d_xq, d_o, QD, N, 1, st);
                 G::k_res_norm2<<<1, G::kThreads, 0, st>>>(d_x, d_o, y.post_attn_norm, y.ffn_norm, d_x1, d_m, N, m->eps);
@@ -821,6 +855,13 @@ struct Engine {
             h_i32[6 * kTmax + t] = 0;
             h_i32[7 * kTmax + t] = p + 1;
         }
+        nu_s = nu_g = 1;
+        for (int t = 0; t < T; ++t) {
+            int d = h_i32[3 * kTmax + t] - h_i32[3 * kTmax];
+            if (d < 0) d += ring;
+            nu_s = std::max(nu_s, d + h_i32[4 * kTmax + t]);
+            nu_g = std::max(nu_g, h_i32[7 * kTmax + t]);
+        }
         CK(cudaMemcpyAsync(i32, h_i32, (size_t) kTmax * 8 * 4, cudaMemcpyHostToDevice, st));
         const int32_t *d_tok = i32, *d_pos = i32 + kTmax, *d_cell_s = i32 + 2 * kTmax, *d_first_s = i32 + 3 * kTmax,
                       *d_cnt_s = i32 + 4 * kTmax, *d_cell_g = i32 + 5 * kTmax, *d_first_g = i32 + 6 * kTmax, *d_cnt_g = i32 + 7 * kTmax;
@@ -843,8 +884,8 @@ struct Engine {
             G::k_attn_prep<<<dim3((unsigned) (y.H + 2 * y.HKV), (unsigned) T), G::kThreads, 0, st>>>(
                 qv, kv, y.has_v ? vv : kv, y.q_norm, y.k_norm, y.swa ? cs_swa : cs_glb, q, y.kc, y.vc,
                 y.swa ? d_cell_s : d_cell_g, y.H, y.HKV, y.HD, y.cap, m->eps);
-            G::k_attn<<<dim3((unsigned) y.H, (unsigned) T), G::kThreads, 0, st>>>(
-                q, y.kc, y.vc, y.swa ? d_first_s : d_first_g, y.swa ? d_cnt_s : d_cnt_g, sc, att, y.H, y.HKV, y.HD, y.cap);
+            attend(q, y.kc, y.vc, y.swa ? d_first_s : d_first_g, y.swa ? d_cnt_s : d_cnt_g, att, y.H, y.HKV, y.HD, y.cap, T,
+                   y.swa ? nu_s : nu_g);
             K::native_quantize_q8_1(att, xq, QD, T, st);
             mmvq(y.wo, xq, o, T);
             (void) KD;
@@ -1047,6 +1088,8 @@ int strata::gemma4::run(int argc, char** argv) {
         else if (a == "--decay") E.decay = (float) std::atof(val().c_str());
         else if (a == "--decay-every") E.decay_every = std::atoi(val().c_str());
         else if (a == "--profile") E.profile = std::atoi(val().c_str()) != 0;
+        else if (a == "--attn") E.attn_shared = val() != "old";
+        else if (a == "--attn-pb") E.attn_pb = std::atoi(val().c_str());
         else if (a == "--split-below") E.split_below = std::atoi(val().c_str());
         else if (a == "--split-tasks") E.split_tasks = std::atoi(val().c_str());
         else if (a == "--help" || a == "-h") {
@@ -1228,7 +1271,8 @@ int strata::gemma4::run(int argc, char** argv) {
                              (double) (ng - 1) / pp, E.ms_draft / pp);
             if (E.profile && s.passes)
                 std::fprintf(stderr, "strata-g4:   profile per pass: attention %.2f ms, FFN block (router, dense, experts, tail) "
-                             "%.2f ms, head %.2f ms\n", E.prof[0] / pp, E.prof[1] / pp, E.prof[2] / pp);
+                             "%.2f ms, head %.2f ms; attention kernels since the start: score %.0f, softmax %.0f, value %.0f, old %.0f ms\n",
+                             E.prof[0] / pp, E.prof[1] / pp, E.prof[2] / pp, E.att_ms[0], E.att_ms[1], E.att_ms[2], E.att_ms[3]);
             if (f_json) {
                 std::fprintf(f_json, "%s{\"id\": \"%s\", \"rep\": %d, \"prompt_tokens\": %zu, \"prompt_ms\": %.3f, \"decode_tokens\": %d, "
                              "\"decode_ms\": %.3f, \"decode_tok_s\": %.4f, \"passes\": %lld, \"gpu_pick_share\": %.5f, "

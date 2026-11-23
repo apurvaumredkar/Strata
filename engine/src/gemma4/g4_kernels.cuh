@@ -102,7 +102,8 @@ __global__ void k_attn_prep(const float* q_in, const float* k_in, const float* v
             v = i < half ? buf[i] * e.x - buf[i + half] * e.y : buf[i - half] * e.y + buf[i] * e.x;
         }
         if (kind == 0) q_out[((size_t) t * H + hh) * HD + i] = v;
-        else (kind == 1 ? kc : vc)[((size_t) hh * cap + cell[t]) * HD + i] = __float2half_rn(v);
+        else if (kind == 1) kc[((size_t) hh * cap + cell[t]) * HD + i] = __float2half_rn(v);
+        else vc[((size_t) hh * HD + i) * cap + cell[t]] = __float2half_rn(v);   // a dimension after the other
     }
 }
 
@@ -144,10 +145,127 @@ __global__ void k_attn(const float* q, const __half* kc, const __half* vc, const
         float a = 0.f;
         int c = f0;
         for (int j = 0; j < n; ++j) {
-            a = fmaf(s[j], __half2float(vb[(size_t) c * HD + i]), a);
+            a = fmaf(s[j], __half2float(vb[(size_t) i * cap + c]), a);
             if (++c == cap) c = 0;
         }
         out[((size_t) t * H + h) * HD + i] = a * iz;
+    }
+}
+
+// ---- the attention the engine runs: k_attn's sums in k_attn's order (the same bits), with the memory read in wide
+// pieces.  A GPU thread waits for every load, so k_attn's 2 bytes a step (a value of every cell, a stride apart) was
+// what its time went to.  Here a key is loaded once for all the query heads and rows that share its KV head, 16 bytes
+// at a time, and the values are stored a dimension after the other ([KV head][dimension][cell]), so a thread's sum
+// over the cells reads 8 of them a load, and its weights 4 a load.
+//   k_attn_score   every (query head, row) product of a cell's key; sc[(row, head)][cell]
+//   k_attn_soft    k_attn's softmax of a (query head, row): the weights in `sc`, 1 / their sum in iz
+//   k_attn_value   a (query head, row)'s sum over its cells in their order
+// k_attn_score's block takes the kAttnPairs / (H / HKV) rows from TB * blockIdx.z; `nu` is the number of cells from the
+// first row's first cell that the rows see between them (the rows are consecutive positions).  cap is a multiple of 8.
+constexpr int kAttnPairs = 16;
+
+__device__ __forceinline__ float half_bits(unsigned v) { return __half2float(__ushort_as_half((unsigned short) v)); }
+
+/// The (row, query head of the KV head) pairs are numbered row * (H / HKV) + head; a block takes PB of them from
+/// PB * blockIdx.z.  grid (HKV, ceil(nu / 256), ceil(T * (H / HKV) / PB)), block 256.
+__global__ void k_attn_score(const float* q, const __half* kc, const int32_t* first, const int32_t* count, float* sc, int H,
+                             int HKV, int HD, int cap, int T, int PB, int nu) {
+    __shared__ float qs[kAttnPairs * 512];
+    const int g = blockIdx.x, hpg = H / HKV, p0 = blockIdx.z * PB;
+    const int np = min(PB, T * hpg - p0);
+    for (int i = threadIdx.x; i < np * HD; i += blockDim.x) {
+        const int pr = i / HD, d = i - pr * HD, pp = p0 + pr;
+        qs[i] = q[((size_t) (pp / hpg) * H + g * hpg + pp % hpg) * HD + d];
+    }
+    __syncthreads();
+    const int u = blockIdx.y * blockDim.x + threadIdx.x;
+    if (u >= nu) return;
+    int c = first[0] + u;
+    if (c >= cap) c -= cap;
+    bool in[kAttnPairs];
+    bool any = false;
+    for (int x = 0; x < np; ++x) {
+        const int r = (p0 + x) / hpg;
+        int j = c - first[r];
+        if (j < 0) j += cap;
+        in[x] = j < count[r];
+        any = any || in[x];
+    }
+    if (!any) return;
+    const uint4* kr = (const uint4*) (kc + ((size_t) g * cap + c) * HD);
+    float a[kAttnPairs];
+    for (int x = 0; x < kAttnPairs; ++x) a[x] = 0.f;
+    for (int b = 0; b < HD / 8; ++b) {
+        const uint4 w = kr[b];
+        const unsigned ws[4] = {w.x, w.y, w.z, w.w};
+        for (int e = 0; e < 8; ++e) {
+            const float kv = half_bits(ws[e >> 1] >> (16 * (e & 1)));
+            const int i = b * 8 + e;
+            for (int x = 0; x < np; ++x) a[x] = fmaf(qs[x * HD + i], kv, a[x]);
+        }
+    }
+    for (int x = 0; x < np; ++x) {
+        const int pp = p0 + x;
+        if (in[x]) sc[((size_t) (pp / hpg) * H + g * hpg + pp % hpg) * cap + c] = a[x];
+    }
+}
+
+/// grid (H, T), block 256.
+__global__ void k_attn_soft(const int32_t* first, const int32_t* count, float* sc, float* iz, int H, int cap) {
+    __shared__ float sh[kThreads];
+    const int h = blockIdx.x, t = blockIdx.y, n = count[t], f0 = first[t];
+    float* s = sc + ((size_t) t * H + h) * cap;
+    float mx = -3.0e38f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        int c = f0 + j;
+        if (c >= cap) c -= cap;
+        mx = fmaxf(mx, s[c]);
+    }
+    mx = block_max(mx, sh);
+    float z = 0.f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        int c = f0 + j;
+        if (c >= cap) c -= cap;
+        const float w = expf(s[c] - mx);
+        s[c] = w;
+        z += w;
+    }
+    z = block_sum(z, sh);
+    if (threadIdx.x == 0) iz[t * H + h] = 1.0f / z;
+}
+
+/// vt is [KV head][dimension][cell].  grid (H, T), block 256.
+__global__ void k_attn_value(const __half* vt, const int32_t* first, const int32_t* count, const float* sc, const float* iz,
+                             float* out, int H, int HKV, int HD, int cap) {
+    const int h = blockIdx.x, t = blockIdx.y, g = h / (H / HKV);
+    const int n = count[t], f0 = first[t];
+    const float* s = sc + ((size_t) t * H + h) * cap;
+    const float izv = iz[t * H + h];
+    for (int i = threadIdx.x; i < HD; i += blockDim.x) {
+        const __half* v = vt + ((size_t) g * HD + i) * cap;
+        float a = 0.f;
+        int left = n, c = f0;
+        while (left > 0) {
+            const int end = min(c + left, cap);
+            int cc = c;
+            for (; cc < end && (cc & 7); ++cc) a = fmaf(s[cc], __half2float(v[cc]), a);
+            for (; cc + 8 <= end; cc += 8) {
+                const uint4 w = *(const uint4*) (v + cc);
+                const float4 s0 = *(const float4*) (s + cc), s1 = *(const float4*) (s + cc + 4);
+                a = fmaf(s0.x, half_bits(w.x), a);
+                a = fmaf(s0.y, half_bits(w.x >> 16), a);
+                a = fmaf(s0.z, half_bits(w.y), a);
+                a = fmaf(s0.w, half_bits(w.y >> 16), a);
+                a = fmaf(s1.x, half_bits(w.z), a);
+                a = fmaf(s1.y, half_bits(w.z >> 16), a);
+                a = fmaf(s1.z, half_bits(w.w), a);
+                a = fmaf(s1.w, half_bits(w.w >> 16), a);
+            }
+            for (; cc < end; ++cc) a = fmaf(s[cc], __half2float(v[cc]), a);
+            left -= end - c;
+            c = 0;
+        }
+        out[((size_t) t * H + h) * HD + i] = a * izv;
     }
 }
 
